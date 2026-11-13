@@ -1,0 +1,39 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+uv.lock
+
+# Testing / Linters
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated exports / renders
+*.png
+*.gif
+*.webp
+*.glb
+*.gltf
+*.obj
+*.mtl
+*.stl
+*.ply
+*.frf.json
+!docs/**
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
