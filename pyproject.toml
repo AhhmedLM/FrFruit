@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "frfruit"
+version = "0.1.0"
+description = "AI-first headless 3D modeling, procedural generation, animation, and rendering engine exposed via MCP"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+authors = [
+  { name = "FrFruit Contributors" },
+]
+keywords = ["3d", "blender", "mcp", "ai", "cad", "procedural", "rendering"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Graphics :: 3D Modeling",
+  "Topic :: Multimedia :: Graphics :: 3D Rendering",
+]
+dependencies = [
+  "mcp>=2.3.0",
+  "pydantic>=2.12.0",
+  "numpy>=2.0.0",
+  "scipy>=1.14.0",
+  "trimesh>=5.2.0",
+  "manifold3d>=3.5.0",
+  "pillow>=12.0.0",
+  "shapely>=2.0.0",
+  "mapbox-earcut>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0.0",
+  "anyio>=4.9.0",
+  "ruff>=0.15.0",
+]
+
+[project.scripts]
+frfruit = "frfruit.cli:main"
+frfruit-mcp = "frfruit.mcp_server.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/frfruit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
