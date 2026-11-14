@@ -52,9 +52,9 @@ Import `.glb`, `.gltf`, `.obj`, `.stl`, or `.ply` files from inside the workspac
 Full Blender-style Edit Mode modeling suite (`36` operations) with semantic or explicit element selection and automatic per-face material slot preservation:
 - **Extrude**: `extrude_faces`, `extrude_individual`, `extrude_along_normals`, `extrude_manifold`, `extrude_edges`, `extrude_vertices`.
 - **Inset & Bevel**: `inset_faces` (`individual=True/False`), `bevel_edges` (angle threshold or targeted edges), `bevel_vertices`.
-- **Cut, Subdivide & Shell**: `subdivide` (whole mesh or selected-faces conformal split), `loop_cut` (`axis`, `cuts`, `slide`, or custom `direction`), `bisect_plane` (`clear_inner`, `clear_outer`, `fill_caps`), `poke_faces`, `bridge_edge_loops`, `fill_holes`, `solidify_faces`, `wireframe_edges`.
+- **Cut, Subdivide & Shell**: `subdivide` (Quad B-Mesh **Catmull-Clark** with optional `crease_angle_deg` sharp-edge preservation, `loop`, `simple`, or conformal selected-faces split via `subdiv_mode`), `loop_cut` (`axis`, `cuts`, `slide`, or custom `direction`), `bisect_plane` (`clear_inner`, `clear_outer`, `fill_caps`), `poke_faces`, `bridge_edge_loops`, `fill_holes`, `solidify_faces`, `wireframe_edges`.
 - **Topology & Components**: `merge_vertices` (`by_distance`, `at_center`), `delete_elements` (`faces`, `vertices`, `edges`, `only_faces`), `dissolve_faces`, `duplicate_faces`, `split_selection`, `separate_selection` (creates new `SceneObject`).
-- **Deform, Normals, UVs & Face Materials**: `transform_selection` (with Proportional Editing `proportional_radius` & `proportional_falloff`), `shrink_fatten`, `to_sphere`, `shear`, `symmetrize`, `randomize_vertices`, `smooth`, `flip_normals`, `recompute_normals`, `repair_manifold`, `project_uvs` (`box`, `planar_x/y/z`, `cylindrical`, `spherical`), `assign_face_material`, `clear_face_materials`.
+- **Deform, Normals, UVs & Face Materials**: `transform_selection` (with Proportional Editing `proportional_radius` & `proportional_falloff`), `shrink_fatten`, `to_sphere`, `shear`, `symmetrize`, `randomize_vertices`, `smooth`, `flip_normals`, `recompute_normals`, `repair_manifold`, `project_uvs` (`box`, `smart_uv` angle-split island packing with `uv_angle_limit_deg` & `island_margin`, `planar_x/y/z`, `cylindrical`, `spherical`), `assign_face_material`, `clear_face_materials`.
 - **Selection (`selection_mode`)**: `all`, `top`, `bottom`, `front`, `back`, `left`, `right`, `normal_dir`, `bbox`, `indices`, `vertex_indices`, `edge_indices`, `coplanar` (with `seed_face`), `boundary`, `material` (with `selection_material_id`), plus `invert=True`.
 
 ### `mesh_boolean`
@@ -62,7 +62,7 @@ Execute exact watertight CSG (`operation="union" | "difference" | "intersection"
 
 ### `modifier_add` & `modifier_manage`
 Manage non-destructive modifier stacks evaluated dynamically on top of base meshes or procedural graphs:
-- **11 Modifier Types**: `mirror`, `array` (`linear` / `radial`), `solidify`, `subdivision`, `bevel`, `boolean`, `taper`, `twist`, `bend`, `displace`, `smooth`.
+- **11 Modifier Types**: `mirror`, `array` (`linear` / `radial`), `solidify`, `subdivision` (`algorithm="catmull_clark"|"loop"|"simple"`, `crease_angle_deg`), `bevel`, `boolean`, `taper`, `twist`, `bend`, `displace`, `smooth`.
 - `modifier_manage` supports `list`, `toggle`, `remove`, `reorder`, and `apply_all`.
 
 ### `mesh_inspect_topology`
@@ -114,7 +114,7 @@ Deterministic placement (`action`):
 ## 5. Materials, Textures, Lighting, Rendering, Post-FX & Export (8 Tools)
 
 ### `material_create_or_assign`
-Actions: `create`, `assign`, `create_and_assign`, `assign_faces`, `clear_faces`, `list_presets`. Supports whole-object OR single-face / selected-face material slot assignment (`face_index`, `face_indices`, or `selection_mode` + `seed_face`/`invert`). Supports linear PBR properties (`base_color`, `secondary_color`, `metallic`, `roughness`, `emission_color`, `emission_strength`, `alpha`) and procedural patterns (`solid`, `checker`, `gradient`, `wood`, `noise`).
+Actions: `create`, `assign`, `create_and_assign`, `assign_faces`, `clear_faces`, `list_presets`. Supports whole-object OR single-face / selected-face material slot assignment (`face_index`, `face_indices`, or `selection_mode` + `seed_face`/`invert`). Uses Cook-Torrance **GGX BRDF** supporting `base_color`, `secondary_color`, `metallic`, `roughness`, `clearcoat`, `clearcoat_roughness`, `sheen`, `subsurface`, `subsurface_color`, `emission_color`, `emission_strength`, `alpha`, and procedural patterns (`solid`, `checker`, `gradient`, `wood`, `noise`).
 - **Built-in Presets (12)**: `clay`, `matte_plastic`, `glossy_ceramic`, `chrome`, `gold`, `copper`, `wood`, `apple_skin`, `leaf_green`, `glass`, `emissive_cyan`, `emissive_amber`.
 
 ### `texture_library`
@@ -124,7 +124,7 @@ Search & fetch online multi-channel PBR texture packs (**Poly Haven**, **ambient
 - Automatically unpacks ARM channel-packed maps, builds `MaterialSpec`, assigns to `object_id`, and supports world-space triplanar UV fallback + Gram-Schmidt TBN bump mapping.
 
 ### `light_manage` & `camera_manage`
-- `light_manage`: `add`, `update`, `delete`, `setup_studio_3point`, `set_world`, `list` (`sun`, `point`, `spot`, `area`).
+- `light_manage`: `add`, `update`, `delete`, `setup_studio_3point`, `set_world` (`sky_mode="gradient"|"physical_sky"|"hdri"`, `hdri_path`, `hdri_rotation_deg`, `hdri_intensity`, `sun_elevation_deg`, `sun_azimuth_deg`, `air_turbidity`, `horizon_color`, `zenith_color`, `ambient_strength`), `list` (`sun`, `point`, `spot`, `area`).
 - `camera_manage`: `add`, `update`, `set_active`, `auto_frame`, `delete`, `list` (perspective & orthographic).
 
 ### `post_process_manage`
@@ -132,7 +132,7 @@ Configure HDR post-processing and default scene render engine:
 - `action`: `"get"` | `"configure"` | `"set_preset"` | `"set_engine"`.
 - `render_engine`: `"software"` | `"raytrace"` (CPU BVH Path Tracer).
 - `preset`: `"cinematic"`, `"architectural"`, `"studio_clean"`, `"dramatic_bloom"`, `"raw_off"`.
-- Fine controls: `tone_mapper` (`aces`, `filmic`, `reinhard`, `none`), `exposure`, `bloom_*`, `ssao_*`, `dof_*`, `vignette_intensity`, `chromatic_aberration`, `saturation`, `contrast`, `temperature`, `sharpen`, `fxaa_enabled`.
+- Fine controls: edge-aware A-Trous bilateral `denoise_enabled` & `denoise_strength`, `tone_mapper` (`aces`, `filmic`, `reinhard`, `none`), `exposure`, `bloom_*`, `ssao_*`, `dof_*`, `vignette_intensity`, `chromatic_aberration`, `saturation`, `contrast`, `temperature`, `sharpen`, `fxaa_enabled`.
 
 ### `render_viewport` & `render_views`
 Headless rendering returning `[TextContent(metadata_json), ImageContent(png_base64)]`:
@@ -160,6 +160,7 @@ Export scene to **`.fbx`** (Kaydara Binary FBX 7.400), **`.fbx` (`format="fbx_as
 - `armature_rig`:
   - `create` / `add_bone`: Create FK hierarchical skeletons (`bones=[{"name", "parent", "head", "tail"}, ...]`).
   - `auto_rig`: Compute normalized top-K inverse-distance bone skin weights (`SkinWeightSpec`) binding any mesh to an armature.
+  - `solve_ik`: FABRIK Inverse Kinematics solver (`bone_name`, `target_pos`, `chain_length`, optional `pole_target`, `ik_iterations`, and optional `frame` keyframing) computing local bone rotations across multi-bone chains.
   - `set_pose` / `keyframe_pose` / `list`: Pose or animate bone rotations/translations on `TimelineState`.
 
 ---

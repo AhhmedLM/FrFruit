@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from frfruit.core.scene import (
@@ -407,3 +408,64 @@ def test_full_edit_mode_modeling_suite_and_face_material_preservation() -> None:
     )
     assert len(summary["selection"]["selected_face_indices"]) == 2
     assert np.isfinite(uv_res.mesh.uvs).all()
+
+
+def test_quad_catmull_clark_subdivision_creases_and_smart_uv() -> None:
+    from frfruit.geometry.bmesh import catmull_clark_subdivide, reconstruct_quads
+    from frfruit.geometry.edit_ops import run_edit_operation
+    from frfruit.textures.uv_unwrap import smart_uv_unwrap
+
+    cube = make_cube(1.0, origin="center")
+    polygons, poly_sources = reconstruct_quads(cube, angle_threshold_deg=15.0)
+    assert len(polygons) == 6
+    assert len(poly_sources) == 6
+    assert all(len(f) == 4 for f in polygons)
+
+    # Smooth Catmull-Clark rounds a cube into a smooth sphere-like watertight cage
+    cc_smooth, _, cc_quads = catmull_clark_subdivide(
+        cube, levels=2, smooth=True, crease_angle_deg=180.0
+    )
+    assert cc_smooth.stats()["is_watertight"] is True
+    assert cc_quads == 6 * 16
+    assert cc_smooth.stats()["face_count"] == 6 * 16 * 2  # 6 quads -> 96 quads -> 192 tris
+    # Rounded cube shrinks slightly inward from corners (radius < 0.5*sqrt(3))
+    corner_r = float(np.linalg.norm(cc_smooth.vertices, axis=1).max())
+    assert corner_r < 0.80
+
+    # Crease-preserving Catmull-Clark keeps sharp 90-degree edges crisp
+    cc_creased, _, _ = catmull_clark_subdivide(cube, levels=1, smooth=True, crease_angle_deg=45.0)
+    assert cc_creased.stats()["is_watertight"] is True
+    assert cc_creased.bounds().size == pytest.approx((1.0, 1.0, 1.0), abs=1e-5)
+
+    # SubdivisionModifier defaults to Catmull-Clark
+    doc = SceneDocument.new_default("CCMod")
+    doc.objects["c"] = SceneObject(
+        id="c",
+        name="CCube",
+        kind="mesh",
+        mesh=cube.to_payload(),
+        modifiers=[SubdivisionModifier(levels=1, smooth=True, algorithm="catmull_clark")],
+    )
+    ev = evaluate_object_mesh(doc, "c")
+    assert ev.world_mesh.stats()["is_watertight"] is True
+    assert ev.world_mesh.stats()["face_count"] == 48
+
+    # Smart UV unwrap + island packing keeps per-face material assignments & bounds in [0, 1]^2
+    uv_mesh, uv_info = smart_uv_unwrap(cube, angle_limit_deg=60.0, island_margin=0.03)
+    assert uv_mesh.uvs is not None
+    assert uv_info["uv_island_count"] == 6  # 6 faces of a cube split at 90 deg > 60 deg
+    assert float(uv_mesh.uvs.min()) >= -1e-6 and float(uv_mesh.uvs.max()) <= 1.0 + 1e-6
+    assert len(uv_mesh.faces) == len(cube.faces)
+
+    # Also test via run_edit_operation
+    res_uv = run_edit_operation(
+        cube,
+        "project_uvs",
+        SelectionQuery(mode="all"),
+        face_material_ids={0: "mat_gold", 1: "mat_gold"},
+        projection="smart_uv",
+        uv_angle_limit_deg=60.0,
+        island_margin=0.03,
+    )
+    assert res_uv.face_material_ids == {0: "mat_gold", 1: "mat_gold"}
+    assert res_uv.extra.get("uv_island_count") == 6

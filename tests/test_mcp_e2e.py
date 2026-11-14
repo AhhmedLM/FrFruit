@@ -838,3 +838,150 @@ async def test_mcp_edit_mode_and_single_face_material_workflow(
     assert any(isinstance(c, ImageContent) for c in rt_img.content)
     assert (workspace / "renders" / "edit_sw.png").read_bytes().startswith(b"\x89PNG")
     assert (workspace / "renders" / "edit_rt.png").read_bytes().startswith(b"\x89PNG")
+
+
+async def test_mcp_blender_parity_catmull_clark_smart_uv_sky_ggx_denoise_ik(
+    mcp_session_and_client,
+) -> None:
+    _, client, workspace = mcp_session_and_client
+
+    # 0. Verify tool count remains strictly 34
+    tools_resp = await client.list_tools()
+    assert len(tools_resp.tools) == 34
+
+    await client.call_tool("scene_new", {"name": "ParityE2E", "clear_history": True})
+
+    # 1. Create cube, Catmull-Clark subdivide with crease preservation, and Smart UV unwrap
+    c_res = _parse_text_json(
+        await client.call_tool("create_primitive", {"primitive": "cube", "name": "SmoothPod"})
+    )
+    cid = c_res["object_id"]
+
+    sub_res = _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": cid,
+                "operation": "subdivide",
+                "selection_mode": "all",
+                "levels": 1,
+                "smooth_subdiv": True,
+                "subdiv_mode": "catmull_clark",
+                "crease_angle_deg": 180.0,
+            },
+        )
+    )
+    assert sub_res["stats"]["is_watertight"] is True
+    assert sub_res["stats"]["face_count"] == 48
+
+    uv_res = _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": cid,
+                "operation": "project_uvs",
+                "selection_mode": "all",
+                "projection": "smart_uv",
+                "uv_angle_limit_deg": 45.0,
+                "island_margin": 0.02,
+            },
+        )
+    )
+    assert uv_res["uv_island_count"] >= 1
+
+    # 2. Configure GGX material (clearcoat + sheen + subsurface) & physical sky + denoiser
+    mat_res = _parse_text_json(
+        await client.call_tool(
+            "material_create_or_assign",
+            {
+                "action": "create_and_assign",
+                "object_id": cid,
+                "name": "LacqueredJade",
+                "base_color": "#2f8c60",
+                "roughness": 0.32,
+                "clearcoat": 0.9,
+                "clearcoat_roughness": 0.05,
+                "sheen": 0.35,
+                "subsurface": 0.6,
+                "subsurface_color": "#5ce69a",
+            },
+        )
+    )
+    assert mat_res["material"]["clearcoat"] == pytest.approx(0.9)
+    assert mat_res["material"]["subsurface"] == pytest.approx(0.6)
+
+    world_res = _parse_text_json(
+        await client.call_tool(
+            "light_manage",
+            {
+                "action": "set_world",
+                "sky_mode": "physical_sky",
+                "sun_elevation_deg": 18.0,
+                "sun_azimuth_deg": 120.0,
+                "air_turbidity": 2.6,
+            },
+        )
+    )
+    assert world_res["world"]["sky_mode"] == "physical_sky"
+
+    pp_res = _parse_text_json(
+        await client.call_tool(
+            "post_process_manage",
+            {
+                "action": "configure",
+                "render_engine": "raytrace",
+                "denoise_enabled": True,
+                "denoise_strength": 0.7,
+            },
+        )
+    )
+    assert pp_res["post_process"]["denoise_enabled"] is True
+
+    # 3. Create armature and run FABRIK solve_ik with pole target & keyframing
+    arm_res = _parse_text_json(
+        await client.call_tool(
+            "armature_rig",
+            {
+                "action": "create",
+                "name": "IKArm",
+                "bones": [
+                    {"name": "upper", "parent": None, "head": [0, 0, 0], "tail": [0, 0, 1]},
+                    {"name": "forearm", "parent": "upper", "head": [0, 0, 1], "tail": [0, 0, 2]},
+                ],
+            },
+        )
+    )
+    aid = arm_res["armature_id"]
+    ik_res = _parse_text_json(
+        await client.call_tool(
+            "armature_rig",
+            {
+                "action": "solve_ik",
+                "armature_id": aid,
+                "bone_name": "forearm",
+                "target_pos": [0.85, 0.2, 1.15],
+                "chain_length": 2,
+                "pole_target": [0.0, 2.0, 1.0],
+                "ik_iterations": 20,
+                "frame": 12,
+            },
+        )
+    )
+    assert ik_res["ik_result"]["target_achieved"] is True
+    assert ik_res["ik_result"]["error"] < 0.02
+    assert len(ik_res["tracks"]) == 6  # 2 bones * 3 axes
+
+    # 4. Render denoised physical-sky raytraced image
+    rt = await client.call_tool(
+        "render_viewport",
+        {
+            "mode": "pbr",
+            "engine": "raytrace",
+            "samples": 2,
+            "width": 160,
+            "height": 128,
+            "save_path": "renders/parity_rt.png",
+        },
+    )
+    assert any(isinstance(c, ImageContent) for c in rt.content)
+    assert (workspace / "renders" / "parity_rt.png").read_bytes().startswith(b"\x89PNG")

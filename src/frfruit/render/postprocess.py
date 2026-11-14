@@ -144,10 +144,98 @@ def _apply_fxaa(img: np.ndarray) -> np.ndarray:
     return out
 
 
+def denoise_image(
+    hdr_rgb: np.ndarray,
+    albedo_buf: np.ndarray | None = None,
+    normal_buf: np.ndarray | None = None,
+    depth_buf: np.ndarray | None = None,
+    strength: float = 0.65,
+) -> np.ndarray:
+    """Edge-aware A-Trous joint bilateral denoiser guided by albedo, normal, and depth buffers."""
+    alpha_blend = float(np.clip(strength, 0.0, 1.0))
+    if alpha_blend <= 1e-4:
+        return hdr_rgb
+    h, w, _ = hdr_rgb.shape
+    if h < 4 or w < 4:
+        return hdr_rgb
+
+    cur = np.asarray(hdr_rgb, dtype=np.float64)
+    orig = cur.copy()
+    has_alb = albedo_buf is not None and albedo_buf.shape[:2] == (h, w)
+    has_nrm = normal_buf is not None and normal_buf.shape[:2] == (h, w)
+    has_dep = depth_buf is not None and depth_buf.shape[:2] == (h, w)
+
+    alb = np.asarray(albedo_buf, dtype=np.float64) if has_alb else None
+    nrm = np.asarray(normal_buf, dtype=np.float64) if has_nrm else None
+    if has_dep and depth_buf is not None:
+        dep_f = np.where(np.isfinite(depth_buf), depth_buf.astype(np.float64), -1.0)
+    else:
+        dep_f = None
+
+    # 3 A-Trous wavelet steps (1px, 2px, 4px) cover a 15x15 effective neighborhood in O(27) shifts
+    kernel_1d = (0.25, 0.5, 0.25)
+    for step_pow in range(3):
+        step = 1 << step_pow
+        sigma_c2 = (0.35 * (0.65**step_pow)) ** 2
+        acc = np.zeros_like(cur)
+        w_sum = np.zeros((h, w, 1), dtype=np.float64)
+
+        for dy_idx, dy in enumerate((-step, 0, step)):
+            ky = kernel_1d[dy_idx]
+            ys0 = max(0, -dy)
+            ys1 = min(h, h - dy)
+            yt0 = ys0 + dy
+            yt1 = ys1 + dy
+            for dx_idx, dx in enumerate((-step, 0, step)):
+                w_sp = ky * kernel_1d[dx_idx]
+                if dy == 0 and dx == 0:
+                    acc += cur * w_sp
+                    w_sum += w_sp
+                    continue
+                xs0 = max(0, -dx)
+                xs1 = min(w, w - dx)
+                xt0 = xs0 + dx
+                xt1 = xs1 + dx
+
+                nb_c = cur[yt0:yt1, xt0:xt1]
+                dc = nb_c - cur[ys0:ys1, xs0:xs1]
+                dc2 = np.sum(dc * dc, axis=2, keepdims=True)
+                wt = w_sp * np.exp(-dc2 / max(1e-5, sigma_c2))
+
+                if alb is not None:
+                    da = alb[yt0:yt1, xt0:xt1] - alb[ys0:ys1, xs0:xs1]
+                    da2 = np.sum(da * da, axis=2, keepdims=True)
+                    wt = wt * np.exp(-da2 / 0.018)
+
+                if nrm is not None:
+                    dn = nrm[yt0:yt1, xt0:xt1] - nrm[ys0:ys1, xs0:xs1]
+                    dn2 = np.sum(dn * dn, axis=2, keepdims=True)
+                    wt = wt * np.exp(-dn2 / 0.08)
+
+                if dep_f is not None:
+                    dz = np.abs(dep_f[yt0:yt1, xt0:xt1] - dep_f[ys0:ys1, xs0:xs1])[..., None]
+                    same_bg = (dep_f[yt0:yt1, xt0:xt1] < 0) & (dep_f[ys0:ys1, xs0:xs1] < 0)
+                    rel_z = np.maximum(
+                        0.15, np.maximum(dep_f[ys0:ys1, xs0:xs1], 0.0)[..., None] * 0.08
+                    )
+                    z_w = np.where(same_bg[..., None], 1.0, np.exp(-(dz * dz) / (rel_z * rel_z)))
+                    wt = wt * z_w
+
+                acc[ys0:ys1, xs0:xs1] += nb_c * wt
+                w_sum[ys0:ys1, xs0:xs1] += wt
+
+        cur = acc / np.maximum(w_sum, 1e-6)
+
+    return orig * (1.0 - alpha_blend) + cur * alpha_blend
+
+
 def apply_post_processing(
     linear_rgb: np.ndarray,
     depth_buf: np.ndarray | None = None,
     config: PostProcessConfig | None = None,
+    *,
+    albedo_buf: np.ndarray | None = None,
+    normal_buf: np.ndarray | None = None,
 ) -> np.ndarray:
     """Run FrFruit's HDR -> sRGB post-processing stack returning float32 RGB in [0, 1]."""
     img = np.asarray(linear_rgb, dtype=np.float64)
@@ -156,6 +244,20 @@ def apply_post_processing(
     if not cfg.enabled:
         srgb = np.power(np.clip(img, 0.0, 1.0), 1.0 / 2.2)
         return np.clip(srgb, 0.0, 1.0).astype(np.float32)
+
+    # 0. Edge-aware Joint Bilateral Denoiser (linear HDR space when feature guides exist)
+    if (
+        cfg.denoise_enabled
+        and cfg.denoise_strength > 1e-4
+        and (albedo_buf is not None or normal_buf is not None)
+    ):
+        img = denoise_image(
+            img,
+            albedo_buf=albedo_buf,
+            normal_buf=normal_buf,
+            depth_buf=depth_buf,
+            strength=cfg.denoise_strength,
+        )
 
     # 1. SSAO (linear space)
     if cfg.ssao_enabled and depth_buf is not None and cfg.ssao_strength > 0.0:

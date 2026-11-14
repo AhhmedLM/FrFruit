@@ -1050,6 +1050,8 @@ def _subdivide_mesh_impl(
     query: SelectionQuery | None = None,
     face_material_ids: dict[int, str] | None = None,
     base_material_id: str | None = None,
+    algorithm: Literal["catmull_clark", "loop", "simple"] = "catmull_clark",
+    crease_angle_deg: float = 180.0,
 ) -> tuple[MeshData, list[int]]:
     if mesh.is_empty:
         return mesh.copy(), list(range(len(mesh.faces)))
@@ -1078,8 +1080,21 @@ def _subdivide_mesh_impl(
                 )
         return cur, sources
 
+    if algorithm == "catmull_clark" and smooth:
+        from frfruit.geometry.bmesh import catmull_clark_subdivide
+
+        cc_mesh, cc_sources, _ = catmull_clark_subdivide(
+            cur,
+            levels=levels,
+            smooth=True,
+            crease_angle_deg=crease_angle_deg,
+            face_sources=sources,
+        )
+        return cc_mesh, cc_sources
+
+    use_smooth = smooth and (algorithm != "simple")
     for _ in range(max(1, min(3, levels))):
-        cur, sources = _subdivide_once(cur, smooth=smooth, sel_mask=None, face_sources=sources)
+        cur, sources = _subdivide_once(cur, smooth=use_smooth, sel_mask=None, face_sources=sources)
     return cur, sources
 
 
@@ -1088,9 +1103,18 @@ def subdivide_mesh(
     levels: int = 1,
     smooth: bool = False,
     query: SelectionQuery | None = None,
+    algorithm: Literal["catmull_clark", "loop", "simple"] = "catmull_clark",
+    crease_angle_deg: float = 180.0,
 ) -> MeshData:
-    """Subdivide triangle mesh (whole mesh or selected faces with conformal neighbors)."""
-    out, _ = _subdivide_mesh_impl(mesh, levels=levels, smooth=smooth, query=query)
+    """Subdivide mesh (Catmull-Clark quad or Loop triangle; conformal on partial selection)."""
+    out, _ = _subdivide_mesh_impl(
+        mesh,
+        levels=levels,
+        smooth=smooth,
+        query=query,
+        algorithm=algorithm,
+        crease_angle_deg=crease_angle_deg,
+    )
     return out
 
 
@@ -2677,14 +2701,26 @@ def recompute_normals(mesh: MeshData, inside: bool = False) -> MeshData:
 def project_uvs(
     mesh: MeshData,
     projection: Literal[
-        "box", "planar_x", "planar_y", "planar_z", "cylindrical", "spherical"
+        "box", "smart_uv", "planar_x", "planar_y", "planar_z", "cylindrical", "spherical"
     ] = "box",
     uv_scale: Vec2 = (1.0, 1.0),
     query: SelectionQuery | None = None,
+    angle_limit_deg: float = 66.0,
+    island_margin: float = 0.02,
 ) -> MeshData:
     """Compute/unwrap UV coordinates in Edit Mode (whole mesh or selected vertices)."""
     if mesh.is_empty:
         return mesh.copy()
+    if projection == "smart_uv":
+        from frfruit.textures.uv_unwrap import smart_uv_unwrap
+
+        out_m, _ = smart_uv_unwrap(
+            mesh,
+            angle_limit_deg=angle_limit_deg,
+            island_margin=island_margin,
+            uv_scale=uv_scale,
+        )
+        return out_m
     verts = mesh.vertices
     vn = mesh.vertex_normals()
     bmin = np.min(verts, axis=0)
@@ -2817,9 +2853,13 @@ def run_edit_operation(
         "-x_to_+x", "+x_to_-x", "-y_to_+y", "+y_to_-y", "-z_to_+z", "+z_to_-z"
     ] = "-x_to_+x",
     projection: Literal[
-        "box", "planar_x", "planar_y", "planar_z", "cylindrical", "spherical"
+        "box", "smart_uv", "planar_x", "planar_y", "planar_z", "cylindrical", "spherical"
     ] = "box",
     uv_scale: Vec2 = (1.0, 1.0),
+    uv_angle_limit_deg: float = 66.0,
+    island_margin: float = 0.02,
+    subdiv_mode: Literal["catmull_clark", "loop", "simple"] = "catmull_clark",
+    crease_angle_deg: float = 180.0,
     flip_normals_flag: bool = False,
     inside: bool = False,
     offset: float = 0.0,
@@ -2929,6 +2969,8 @@ def run_edit_operation(
             query=query,
             face_material_ids=fm,
             base_material_id=base_material_id,
+            algorithm=subdiv_mode,
+            crease_angle_deg=crease_angle_deg,
         )
         return EditOpOutput(mesh=out_m, face_material_ids=_remap_face_materials(fm, src))
 
@@ -3090,7 +3132,24 @@ def run_edit_operation(
         return EditOpOutput(mesh=out_m, face_material_ids=fm)
 
     if operation == "project_uvs":
-        out_m = project_uvs(mesh, projection=projection, uv_scale=uv_scale, query=query)
+        if projection == "smart_uv":
+            from frfruit.textures.uv_unwrap import smart_uv_unwrap
+
+            out_m, uv_extra = smart_uv_unwrap(
+                mesh,
+                angle_limit_deg=uv_angle_limit_deg,
+                island_margin=island_margin,
+                uv_scale=uv_scale,
+            )
+            return EditOpOutput(mesh=out_m, face_material_ids=fm, extra=uv_extra)
+        out_m = project_uvs(
+            mesh,
+            projection=projection,
+            uv_scale=uv_scale,
+            query=query,
+            angle_limit_deg=uv_angle_limit_deg,
+            island_margin=island_margin,
+        )
         return EditOpOutput(mesh=out_m, face_material_ids=fm)
 
     if operation == "assign_face_material":

@@ -218,7 +218,13 @@ def evaluate_modifier_stack(
         elif isinstance(mod, SolidifyModifier):
             cur = _apply_solidify(cur, mod)
         elif isinstance(mod, SubdivisionModifier):
-            cur = subdivide_mesh(cur, levels=mod.levels, smooth=mod.smooth)
+            cur = subdivide_mesh(
+                cur,
+                levels=mod.levels,
+                smooth=mod.smooth,
+                algorithm=mod.algorithm,
+                crease_angle_deg=mod.crease_angle_deg,
+            )
         elif isinstance(mod, BevelModifier):
             cur = bevel_edges(
                 cur,

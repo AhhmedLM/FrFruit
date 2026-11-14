@@ -196,3 +196,80 @@ def test_fbx_per_face_multi_material_bypolygon(tmp_path: Path) -> None:
     export_fbx_scene(sc, fbx_bin, ascii_mode=False, target_engine="unreal")
     chk = verify_fbx_binary(fbx_bin)
     assert chk["valid"] is True
+
+
+def test_armature_fabrik_ik_solver_pole_and_skin_deformation() -> None:
+    from frfruit.animation.armature import compute_armature_matrices, solve_armature_ik
+
+    # 1. Two-bone chain along +Z (total length = 2.0) + skin deformation check
+    arm = ArmatureSpec(
+        bones=[
+            BoneSpec(name="upper", parent=None, head=(0.0, 0.0, 0.0), tail=(0.0, 0.0, 1.0)),
+            BoneSpec(name="forearm", parent="upper", head=(0.0, 0.0, 1.0), tail=(0.0, 0.0, 2.0)),
+        ]
+    )
+    res_reach = solve_armature_ik(
+        arm,
+        tip_bone="forearm",
+        target_pos=(0.9, 0.0, 1.1),
+        chain_length=2,
+        pole_target=(0.0, 2.0, 1.0),
+        iterations=24,
+    )
+    assert res_reach["target_achieved"] is True
+    assert res_reach["error"] < 1e-2
+    assert len(arm.ik_targets) == 1 and arm.ik_targets[0].bone_name == "forearm"
+
+    # Verify elbow joint bends toward +Y pole_target
+    _, poses, _ = compute_armature_matrices(arm)
+    elbow_pos = poses["forearm"][:3, 3]
+    assert float(elbow_pos[1]) > 0.25
+
+    # Skinned cylinder follows solved IK chain
+    sc = SceneDocument.new_default("IKSkin")
+    arm_obj = SceneObject(
+        id="arm",
+        name="ArmIK",
+        kind="armature",
+        armature=arm,
+    )
+    sc.objects["arm"] = arm_obj
+    limb = create_primitive_mesh("cylinder", radius=0.15, height=2.0, segments=10)
+    mesh_obj = SceneObject(
+        id="limb",
+        name="Limb",
+        kind="mesh",
+        transform=Transform(location=(0.0, 0.0, 1.0)),
+        mesh=limb.to_payload(),
+    )
+    sc.objects["limb"] = mesh_obj
+    mesh_obj.skin = auto_rig_mesh(
+        evaluate_object_mesh(sc, "limb").local_mesh,
+        evaluate_object_mesh(sc, "limb").world_matrix,
+        arm_obj,
+        compute_world_matrix(sc, "arm"),
+    )
+    ev_deformed = evaluate_object_mesh(sc, "limb")
+    # Tip vertices should shift close to +X target (x ~ 0.9)
+    assert float(ev_deformed.world_mesh.vertices[:, 0].max()) > 0.7
+
+    # 2. 3-bone chain & out-of-reach clamping
+    arm3 = ArmatureSpec(
+        bones=[
+            BoneSpec(name="b0", parent=None, head=(0.0, 0.0, 0.0), tail=(0.0, 0.0, 1.0)),
+            BoneSpec(name="b1", parent="b0", head=(0.0, 0.0, 1.0), tail=(0.0, 0.0, 2.0)),
+            BoneSpec(name="b2", parent="b1", head=(0.0, 0.0, 2.0), tail=(0.0, 0.0, 3.0)),
+        ]
+    )
+    res3 = solve_armature_ik(
+        arm3, tip_bone="b2", target_pos=(1.5, 0.6, 1.2), chain_length=3, iterations=24
+    )
+    assert res3["target_achieved"] is True
+    assert res3["error"] < 1e-2
+
+    # Far target outside reach (total len=3.0) clamps cleanly on line toward target
+    res_far = solve_armature_ik(
+        arm3, tip_bone="b2", target_pos=(5.0, 0.0, 0.0), chain_length=3, iterations=16
+    )
+    assert res_far["achieved_tip"][0] > 2.98
+    assert abs(res_far["achieved_tip"][2]) < 1e-3

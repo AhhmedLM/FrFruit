@@ -11,8 +11,9 @@ from PIL import Image
 from frfruit.core.scene import LightSpec, MaterialSpec, SceneDocument, SceneObject
 from frfruit.geometry.spatial import EvaluatedObject
 from frfruit.render.camera import build_camera_matrices
-from frfruit.render.materials import evaluate_material_maps
+from frfruit.render.materials import evaluate_ggx_brdf, evaluate_material_maps
 from frfruit.render.postprocess import apply_post_processing
+from frfruit.render.sky import evaluate_world_sky
 from frfruit.render.software import RenderConfig, _draw_segment_z
 
 
@@ -258,46 +259,8 @@ def _sample_sky(
     *,
     studio_ibl: bool = False,
 ) -> np.ndarray:
-    """Evaluate linear HDR procedural sky dome + visible sun discs along ray directions."""
-    z_t = np.clip(0.5 + dirs[:, 2:3] * 0.85, 0.0, 1.0)
-    horizon_lin = np.power(np.clip(np.asarray(scene.world.horizon_color), 0.0, 1.0), 2.2)[None, :]
-    zenith_lin = np.power(np.clip(np.asarray(scene.world.zenith_color), 0.0, 1.0), 2.2)[None, :]
-    sky = horizon_lin * (1.0 - z_t) + zenith_lin * z_t
-
-    if studio_ibl and scene.world.ambient_strength > 1e-4:
-        # Lift reflection/refraction sky response when primary backdrop is a dark matte studio
-        sky_avg = float(np.mean(0.5 * horizon_lin + 0.5 * zenith_lin))
-        studio_blend = float(np.clip(1.0 - sky_avg * 2.8, 0.12, 1.0))
-        hemi = np.clip(0.5 + 0.5 * dirs[:, 2:3], 0.0, 1.0)
-        horizon_band = np.exp(-((dirs[:, 2:3] - 0.10) ** 2) / 0.16)
-        dome = (
-            np.array([[0.10, 0.11, 0.14]]) * (1.0 - hemi)
-            + np.array([[0.40, 0.44, 0.52]]) * hemi
-            + np.array([[0.26, 0.25, 0.23]]) * horizon_band
-        )
-        c_warm = np.array([0.48, -0.52, 0.70])
-        c_warm /= np.linalg.norm(c_warm)
-        c_cool = np.array([-0.68, 0.38, 0.62])
-        c_cool /= np.linalg.norm(c_cool)
-        card_w = np.power(
-            np.clip(np.sum(dirs * c_warm[None, :], axis=1, keepdims=True), 0.0, 1.0), 8.0
-        )
-        card_c = np.power(
-            np.clip(np.sum(dirs * c_cool[None, :], axis=1, keepdims=True), 0.0, 1.0), 10.0
-        )
-        studio_rad = (
-            dome + card_w * np.array([[1.20, 1.08, 0.88]]) + card_c * np.array([[0.52, 0.70, 1.02]])
-        )
-        amb_scale = float(np.clip(scene.world.ambient_strength / 0.35, 0.25, 1.6))
-        sky = np.maximum(sky, studio_rad * amb_scale * studio_blend)
-
-    for s_dir, s_col in sun_dirs:
-        cos_ang = np.sum(dirs * s_dir[None, :], axis=1, keepdims=True)
-        # Subtle atmospheric halo + bright specular sun disc
-        halo = np.power(np.clip(cos_ang, 0.0, 1.0), 64.0) * 0.35
-        disc = (cos_ang > 0.996).astype(np.float64) * 3.5
-        sky = sky + (halo + disc) * s_col[None, :]
-    return sky
+    """Evaluate world radiance (gradient, physical Rayleigh/Mie sky, or equirectangular HDRI)."""
+    return evaluate_world_sky(dirs, scene, sun_dirs, studio_ibl=studio_ibl)
 
 
 class PathTracerRenderer:
@@ -490,8 +453,10 @@ class PathTracerRenderer:
             u8 = np.clip(bg * 255.0, 0, 255).astype(np.uint8)
             return Image.fromarray(u8, mode="RGB")
 
-        # Full Monte Carlo Path Tracing accumulation buffer
+        # Full Monte Carlo Path Tracing accumulation buffer + denoiser feature guides
         radiance_accum = np.zeros((n_pix, 3), dtype=np.float64)
+        albedo_accum = np.zeros((n_pix, 3), dtype=np.float64)
+        normal_accum = np.zeros((n_pix, 3), dtype=np.float64)
         depth_cam = np.full((n_pix,), np.inf, dtype=np.float32)
         z_ndc_buf = np.full((n_pix,), np.inf, dtype=np.float32)
 
@@ -502,30 +467,40 @@ class PathTracerRenderer:
             albedo_lin: np.ndarray,
             roughness: np.ndarray,
             metallic: np.ndarray,
-            fresnel: np.ndarray,
+            f0: np.ndarray,
             ao: np.ndarray,
             emission_lin: np.ndarray,
+            extra_mat: dict[str, np.ndarray] | None = None,
             soft_shadows: bool = True,
         ) -> np.ndarray:
             k = len(pos)
-            # Hemisphere ambient & ground/sky fill scaled cleanly with bounce
-            hemi_t = 0.5 + 0.5 * nrm[:, 2:3]
-            sky_c = (
-                np.power(np.clip(np.asarray(scene.world.zenith_color), 0.0, 1.0), 2.2)[None, :]
-                * 1.4
-                + 0.08
-            )
-            gnd_c = (
-                np.power(np.clip(np.asarray(scene.world.horizon_color), 0.0, 1.0), 2.2)[None, :]
-                * 0.8
-                + 0.04
-            )
-            amb_col = gnd_c * (1.0 - hemi_t) + sky_c * hemi_t
+            # Hemisphere ambient & ground/sky fill driven by active world sky mode
+            if scene.world.sky_mode == "gradient":
+                hemi_t = 0.5 + 0.5 * nrm[:, 2:3]
+                sky_c = (
+                    np.power(np.clip(np.asarray(scene.world.zenith_color), 0.0, 1.0), 2.2)[None, :]
+                    * 1.4
+                    + 0.08
+                )
+                gnd_c = (
+                    np.power(np.clip(np.asarray(scene.world.horizon_color), 0.0, 1.0), 2.2)[None, :]
+                    * 0.8
+                    + 0.04
+                )
+                amb_col = gnd_c * (1.0 - hemi_t) + sky_c * hemi_t
+            else:
+                amb_col = _sample_sky(nrm, scene, []) * 0.72
+
             direct = (
                 albedo_lin * amb_col * scene.world.ambient_strength * (1.0 - metallic) * ao * 0.65
                 + emission_lin
             )
-            shininess = np.clip((1.0 - roughness) ** 2 * 180.0 + 6.0, 4.0, 256.0)
+
+            cc = extra_mat["clearcoat"] if extra_mat else 0.0
+            cc_r = extra_mat["clearcoat_roughness"] if extra_mat else 0.08
+            shn = extra_mat["sheen"] if extra_mat else 0.0
+            sss = extra_mat["subsurface"] if extra_mat else 0.0
+            sss_c = extra_mat.get("subsurface_color") if extra_mat else None
 
             for lobj, lspec in lights:
                 lcol = np.asarray(lspec.color, dtype=np.float64)[None, :] * float(lspec.intensity)
@@ -564,7 +539,8 @@ class PathTracerRenderer:
 
                 ndl = np.clip(np.sum(nrm * l_vec, axis=1, keepdims=True), 0.0, 1.0)
                 atten_mask = atten[:, 0] > 1e-4 if np.ndim(atten) > 1 else True
-                lit_mask = (ndl[:, 0] > 1e-4) & atten_mask
+                has_sss = np.any(sss > 1e-4)
+                lit_mask = ((ndl[:, 0] > 1e-4) | has_sss) & atten_mask
                 shadow = np.ones((k, 1), dtype=np.float64)
                 if cfg.enable_shadows and lspec.cast_shadows and np.any(lit_mask):
                     lit_idx = np.nonzero(lit_mask)[0]
@@ -572,14 +548,21 @@ class PathTracerRenderer:
                     occ = bvh.intersect_occluded(s_orig, s_ray_d[lit_idx], max_d[lit_idx])
                     shadow[lit_idx, 0] = np.where(occ, 0.0, 1.0)
 
-                half_v = l_vec + view_dir
-                hv_len = np.linalg.norm(half_v, axis=1, keepdims=True)
-                half_v = half_v / np.where(hv_len < 1e-12, 1.0, hv_len)
-                ndh = np.clip(np.sum(nrm * half_v, axis=1, keepdims=True), 0.0, 1.0)
-                spec_pow = np.power(ndh, shininess) * (0.25 + 0.75 * (1.0 - roughness))
-                diff = albedo_lin * (1.0 - metallic) * ndl
-                spec = fresnel * spec_pow * ndl * 1.4
-                direct += (diff + spec) * lcol * atten * shadow
+                brdf = evaluate_ggx_brdf(
+                    nrm,
+                    view_dir,
+                    l_vec,
+                    albedo_lin,
+                    roughness,
+                    metallic,
+                    f0,
+                    clearcoat=cc,
+                    clearcoat_roughness=cc_r,
+                    sheen=shn,
+                    subsurface=sss,
+                    subsurface_color=sss_c,
+                )
+                direct += brdf * lcol * atten * shadow
 
             return direct
 
@@ -602,6 +585,7 @@ class PathTracerRenderer:
             np.ndarray,
             np.ndarray,
             np.ndarray,
+            dict[str, np.ndarray],
         ]:
             k = len(tri_ids)
             pos = orig + dirs * t_hit[:, None]
@@ -640,6 +624,11 @@ class PathTracerRenderer:
             emission = np.zeros((k, 3), dtype=np.float64)
             alpha = np.ones((k, 1), dtype=np.float64)
             ior = np.full((k, 1), 1.45, dtype=np.float64)
+            clearcoat = np.zeros((k, 1), dtype=np.float64)
+            clearcoat_roughness = np.full((k, 1), 0.08, dtype=np.float64)
+            sheen = np.zeros((k, 1), dtype=np.float64)
+            subsurface = np.zeros((k, 1), dtype=np.float64)
+            subsurface_color = np.full((k, 3), -1.0, dtype=np.float64)
             shaded_nrm = nrm_oriented.copy()
 
             if cfg.mode == "clay":
@@ -661,6 +650,14 @@ class PathTracerRenderer:
                     ao[mask_m] = ao_m
                     alpha[mask_m] = float(mspec.alpha * mspec.base_color[3])
                     ior[mask_m] = float(mspec.ior)
+                    clearcoat[mask_m] = float(mspec.clearcoat)
+                    clearcoat_roughness[mask_m] = float(mspec.clearcoat_roughness)
+                    sheen[mask_m] = float(mspec.sheen)
+                    subsurface[mask_m] = float(mspec.subsurface)
+                    if mspec.subsurface_color is not None:
+                        subsurface_color[mask_m] = np.power(
+                            np.clip(np.asarray(mspec.subsurface_color), 0.0, 1.0), 2.2
+                        )
                     if mspec.emission_strength > 0:
                         emission[mask_m] = (
                             np.asarray(mspec.emission_color[:3])[None, :] * mspec.emission_strength
@@ -668,6 +665,19 @@ class PathTracerRenderer:
 
             albedo_lin = np.power(np.clip(albedo, 0.0, 1.0), 2.2)
             emission_lin = np.power(np.clip(emission, 0.0, 1.0), 2.2)
+            # Fall back subsurface_color to warm albedo tint where unspecified
+            sss_col_resolved = np.where(
+                subsurface_color >= 0.0,
+                subsurface_color,
+                np.clip(albedo_lin * np.array([[1.15, 0.62, 0.48]]), 0.0, 1.0),
+            )
+            extra = {
+                "clearcoat": clearcoat,
+                "clearcoat_roughness": clearcoat_roughness,
+                "sheen": sheen,
+                "subsurface": subsurface,
+                "subsurface_color": sss_col_resolved,
+            }
             return (
                 pos,
                 shaded_nrm,
@@ -680,6 +690,7 @@ class PathTracerRenderer:
                 alpha,
                 ior,
                 front_face,
+                extra,
             )
 
         for s_idx in range(samples):
@@ -710,7 +721,9 @@ class PathTracerRenderer:
             sample_rgb = np.zeros((n_pix, 3), dtype=np.float64)
             miss_mask = ~hit_mask
             if np.any(miss_mask):
-                sample_rgb[miss_mask] = _sample_sky(dirs[miss_mask], scene, sun_dirs)
+                sky_miss = _sample_sky(dirs[miss_mask], scene, sun_dirs)
+                sample_rgb[miss_mask] = sky_miss
+                albedo_accum[miss_mask] += np.clip(sky_miss, 0.0, 1.0)
 
             if np.any(hit_mask):
                 h_idx = np.nonzero(hit_mask)[0]
@@ -726,6 +739,7 @@ class PathTracerRenderer:
                     alpha,
                     ior,
                     front_face,
+                    mat_extra,
                 ) = evaluate_hit_surface(
                     orig[h_idx],
                     dirs[h_idx],
@@ -734,6 +748,8 @@ class PathTracerRenderer:
                     best_u[h_idx],
                     best_v[h_idx],
                 )
+                albedo_accum[h_idx] += albedo_lin
+                normal_accum[h_idx] += nrm
 
                 ndv = np.clip(np.sum(nrm * view_dir, axis=1, keepdims=True), 0.0, 1.0)
                 f0 = 0.04 * (1.0 - metallic) + albedo_lin * metallic
@@ -746,9 +762,10 @@ class PathTracerRenderer:
                     albedo_lin,
                     roughness,
                     metallic,
-                    fresnel,
+                    f0,
                     ao,
                     emission_lin,
+                    extra_mat=mat_extra,
                     soft_shadows=True,
                 )
                 pixel_rad = direct * alpha
@@ -780,6 +797,7 @@ class PathTracerRenderer:
                                 _,
                                 _,
                                 _,
+                                g_extra,
                             ) = evaluate_hit_surface(
                                 gi_orig[gh_sub],
                                 gi_dirs[gh_sub],
@@ -788,9 +806,7 @@ class PathTracerRenderer:
                                 gu[gh_sub],
                                 gv[gh_sub],
                             )
-                            g_ndv = np.clip(np.sum(g_nrm * g_vdir, axis=1, keepdims=True), 0.0, 1.0)
                             g_f0 = 0.04 * (1.0 - g_mtl) + g_alb * g_mtl
-                            g_fres = g_f0 + (1.0 - g_f0) * ((1.0 - g_ndv) ** 5)
                             gi_rad[gh_sub] = shade_direct(
                                 g_pos,
                                 g_nrm,
@@ -798,15 +814,21 @@ class PathTracerRenderer:
                                 g_alb,
                                 g_rgh,
                                 g_mtl,
-                                g_fres,
+                                g_f0,
                                 g_ao,
                                 g_emi,
+                                extra_mat=g_extra,
                                 soft_shadows=False,
                             )
                         pixel_rad[g_i] += gi_rad * gi_weight[g_i]
 
-                # 2. Specular Fresnel reflection (recursive up to max_bounces)
-                refl_weight = fresnel * (metallic + (1.0 - metallic) * (1.0 - roughness * 0.7))
+                # 2. Specular Fresnel reflection (recursive up to max_bounces, including Clearcoat)
+                cc_w = mat_extra["clearcoat"] * (0.04 + 0.96 * ((1.0 - ndv) ** 5))
+                base_refl = fresnel * (metallic + (1.0 - metallic) * (1.0 - roughness * 0.7))
+                refl_weight = np.maximum(
+                    base_refl, cc_w * (1.0 - mat_extra["clearcoat_roughness"] * 0.5)
+                )
+                eff_rough = np.where(cc_w > base_refl, mat_extra["clearcoat_roughness"], roughness)
                 refl_active = (np.max(refl_weight, axis=1) > 0.04) & (max_bounces >= 2)
                 if np.any(refl_active):
                     r_i = np.nonzero(refl_active)[0]
@@ -818,7 +840,7 @@ class PathTracerRenderer:
                         * nrm[r_i]
                     )
                     # Glossy microfacet roughness perturbation
-                    cur_d += rng.normal(0.0, 1.0, size=cur_d.shape) * (roughness[r_i] ** 2 * 0.35)
+                    cur_d += rng.normal(0.0, 1.0, size=cur_d.shape) * (eff_rough[r_i] ** 2 * 0.35)
                     cur_d /= np.maximum(np.linalg.norm(cur_d, axis=1, keepdims=True), 1e-12)
                     tp = refl_weight[r_i].copy()
                     active_map = r_i.copy()
@@ -848,6 +870,7 @@ class PathTracerRenderer:
                             _,
                             _,
                             _,
+                            r_extra,
                         ) = evaluate_hit_surface(
                             cur_o[rh_sub],
                             cur_d[rh_sub],
@@ -866,9 +889,10 @@ class PathTracerRenderer:
                             r_alb,
                             r_rgh,
                             r_mtl,
-                            r_fres,
+                            r_f0,
                             r_ao,
                             r_emi,
+                            extra_mat=r_extra,
                             soft_shadows=False,
                         )
                         pixel_rad[active_map[rh_sub]] += r_direct * tp[rh_sub]
@@ -927,6 +951,7 @@ class PathTracerRenderer:
                             _,
                             _,
                             _,
+                            t_extra,
                         ) = evaluate_hit_surface(
                             t_orig[th_sub],
                             t_dir[th_sub],
@@ -935,9 +960,7 @@ class PathTracerRenderer:
                             tu[th_sub],
                             tv[th_sub],
                         )
-                        t_ndv = np.clip(np.sum(t_nrm * t_vdir, axis=1, keepdims=True), 0.0, 1.0)
                         t_f0 = 0.04 * (1.0 - t_mtl) + t_alb * t_mtl
-                        t_fres = t_f0 + (1.0 - t_f0) * ((1.0 - t_ndv) ** 5)
                         trans_rad[th_sub] = shade_direct(
                             t_pos,
                             t_nrm,
@@ -945,9 +968,10 @@ class PathTracerRenderer:
                             t_alb,
                             t_rgh,
                             t_mtl,
-                            t_fres,
+                            t_f0,
                             t_ao,
                             t_emi,
+                            extra_mat=t_extra,
                             soft_shadows=False,
                         )
                     pixel_rad[t_i] += trans_rad * t_weight
@@ -968,12 +992,20 @@ class PathTracerRenderer:
             radiance_accum += sample_rgb
 
         hdr_buf = (radiance_accum / samples).reshape((h, w, 3)).astype(np.float32)
+        albedo_2d = (albedo_accum / samples).reshape((h, w, 3)).astype(np.float32)
+        normal_2d = (normal_accum / samples).reshape((h, w, 3)).astype(np.float32)
         depth_2d = depth_cam.reshape((h, w))
         z_2d = z_ndc_buf.reshape((h, w))
 
         # Avoid double-blurring DOF since physical lens jitter already ran during ray generation
         pp_cfg = scene.post_process.model_copy(update={"dof_enabled": False})
-        bg = apply_post_processing(hdr_buf, depth_buf=depth_2d, config=pp_cfg)
+        bg = apply_post_processing(
+            hdr_buf,
+            depth_buf=depth_2d,
+            config=pp_cfg,
+            albedo_buf=albedo_2d,
+            normal_buf=normal_2d,
+        )
 
         if cfg.show_grid:
             grid_extent = 5

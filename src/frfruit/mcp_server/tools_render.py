@@ -148,6 +148,23 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
         ] = None,
         emission_strength: Annotated[float | None, Field(ge=0.0)] = None,
         alpha: Annotated[float | None, Field(ge=0.0, le=1.0)] = None,
+        clearcoat: Annotated[
+            float | None, Field(ge=0.0, le=1.0, description="Dielectric clearcoat layer weight.")
+        ] = None,
+        clearcoat_roughness: Annotated[
+            float | None, Field(ge=0.01, le=1.0, description="Clearcoat specular roughness.")
+        ] = None,
+        sheen: Annotated[
+            float | None, Field(ge=0.0, le=1.0, description="Grazing fabric velvet sheen weight.")
+        ] = None,
+        subsurface: Annotated[
+            float | None,
+            Field(ge=0.0, le=1.0, description="Subsurface wrap scattering weight."),
+        ] = None,
+        subsurface_color: Annotated[
+            str | list[float] | None,
+            Field(description="Subsurface scattering tint color (hex or [r,g,b])."),
+        ] = None,
         pattern: Annotated[
             Literal["solid", "checker", "gradient", "wood", "noise"] | None,
             Field(description="Procedural surface pattern."),
@@ -285,6 +302,8 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                     base_kwargs["secondary_color"] = parse_color_rgba(secondary_color)
                 if emission_color is not None:
                     base_kwargs["emission_color"] = parse_color_rgba(emission_color)
+                if subsurface_color is not None:
+                    base_kwargs["subsurface_color"] = parse_color_rgba(subsurface_color)[:3]
             except ValueError as exc:
                 raise ToolError(str(exc)) from exc
 
@@ -293,6 +312,10 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                 ("roughness", roughness),
                 ("emission_strength", emission_strength),
                 ("alpha", alpha),
+                ("clearcoat", clearcoat),
+                ("clearcoat_roughness", clearcoat_roughness),
+                ("sheen", sheen),
+                ("subsurface", subsurface),
                 ("pattern", pattern),
                 ("pattern_scale", pattern_scale),
             ):
@@ -365,9 +388,36 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
         spot_angle_deg: Annotated[float | None, Field(ge=1.0, le=175.0)] = None,
         cast_shadows: Annotated[bool | None, Field(description="Enable shadow casting.")] = None,
         background_color: Annotated[
-            ColorRGB | None, Field(description="World horizon/bg RGB.")
+            ColorRGB | None, Field(description="World background/horizon RGB.")
         ] = None,
+        horizon_color: Annotated[ColorRGB | None, Field(description="World horizon RGB.")] = None,
+        zenith_color: Annotated[ColorRGB | None, Field(description="World zenith RGB.")] = None,
         ambient_strength: Annotated[float | None, Field(ge=0.0, le=2.0)] = None,
+        sky_mode: Annotated[
+            Literal["gradient", "physical_sky", "hdri"] | None,
+            Field(description="World sky and IBL lighting model."),
+        ] = None,
+        hdri_path: Annotated[
+            str | None,
+            Field(description="Workspace path to .hdr/.png/.jpg equirectangular HDRI map."),
+        ] = None,
+        hdri_rotation_deg: Annotated[
+            float | None, Field(description="HDRI azimuth rotation in degrees.")
+        ] = None,
+        hdri_intensity: Annotated[
+            float | None, Field(ge=0.0, le=20.0, description="HDRI brightness multiplier.")
+        ] = None,
+        sun_elevation_deg: Annotated[
+            float | None,
+            Field(ge=-15.0, le=90.0, description="Physical sky sun elevation in degrees."),
+        ] = None,
+        sun_azimuth_deg: Annotated[
+            float | None,
+            Field(ge=-360.0, le=360.0, description="Physical sky sun azimuth in degrees."),
+        ] = None,
+        air_turbidity: Annotated[
+            float | None, Field(ge=1.0, le=10.0, description="Physical sky atmospheric turbidity.")
+        ] = None,
     ) -> dict[str, Any]:
         """Add, update, delete lights, configure 3-point studio lighting, or adjust world sky."""
         sess = get_session()
@@ -389,12 +439,32 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
 
             if action == "set_world":
                 sess.push_history("set_world")
+                w = sess.scene.world
                 if background_color is not None:
-                    sess.scene.world.background_color = background_color
-                    sess.scene.world.horizon_color = background_color
+                    w.background_color = background_color
+                    if horizon_color is None:
+                        w.horizon_color = background_color
+                if horizon_color is not None:
+                    w.horizon_color = horizon_color
+                if zenith_color is not None:
+                    w.zenith_color = zenith_color
                 if ambient_strength is not None:
-                    sess.scene.world.ambient_strength = ambient_strength
-                return {"status": "ok", "world": sess.scene.world.model_dump()}
+                    w.ambient_strength = ambient_strength
+                if sky_mode is not None:
+                    w.sky_mode = sky_mode
+                if hdri_path is not None:
+                    w.hdri_path = str(sess.resolve_path(hdri_path, must_exist=True))
+                if hdri_rotation_deg is not None:
+                    w.hdri_rotation_deg = hdri_rotation_deg
+                if hdri_intensity is not None:
+                    w.hdri_intensity = hdri_intensity
+                if sun_elevation_deg is not None:
+                    w.sun_elevation_deg = sun_elevation_deg
+                if sun_azimuth_deg is not None:
+                    w.sun_azimuth_deg = sun_azimuth_deg
+                if air_turbidity is not None:
+                    w.air_turbidity = air_turbidity
+                return {"status": "ok", "world": w.model_dump()}
 
             if action == "setup_studio_3point":
                 sess.push_history("setup_studio_3point")

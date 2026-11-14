@@ -14,8 +14,9 @@ from frfruit.core.math3d import look_at_matrix, orthographic_matrix, transform_p
 from frfruit.core.scene import LightSpec, MaterialSpec, SceneDocument, SceneObject
 from frfruit.geometry.spatial import EvaluatedObject, compute_scene_bounds
 from frfruit.render.camera import build_camera_matrices
-from frfruit.render.materials import evaluate_material_maps
+from frfruit.render.materials import evaluate_ggx_brdf, evaluate_material_maps
 from frfruit.render.postprocess import apply_post_processing
+from frfruit.render.sky import evaluate_world_sky
 
 RenderMode = Literal["pbr", "clay", "wireframe", "normals", "depth", "collision"]
 
@@ -352,21 +353,61 @@ class SoftwareRenderer:
         view, proj, eye_world = build_camera_matrices(cam_obj, aspect)
         vp = proj @ view
 
-        # Background sky gradient (stored linear for HDR modes, display for diagnostic modes)
-        y_frac = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
-        zenith = np.asarray(scene.world.zenith_color, dtype=np.float32)[None, None, :]
-        horizon = np.asarray(scene.world.horizon_color, dtype=np.float32)[None, None, :]
+        # Background sky (gradient, physical Rayleigh/Mie sky, or HDRI equirectangular map)
+        hdr_mode = cfg.mode in ("pbr", "clay", "wireframe")
         if cfg.mode in ("depth",):
             bg = np.zeros((h, w, 3), dtype=np.float32)
         elif cfg.mode in ("normals", "clay"):
             bg = np.full((h, w, 3), 0.14, dtype=np.float32)
+            if hdr_mode:
+                bg = np.power(np.clip(bg, 0.0, 1.0), 2.2)
+        elif scene.world.sky_mode in ("physical_sky", "hdri") and cfg.mode in ("pbr", "wireframe"):
+            cam_spec = cam_obj.camera
+            assert cam_spec is not None
+            c2w = np.linalg.inv(view)
+            yy, xx = np.mgrid[0:h, 0:w]
+            ndc_x = ((xx.reshape(-1) + 0.5) / w) * 2.0 - 1.0
+            ndc_y = 1.0 - ((yy.reshape(-1) + 0.5) / h) * 2.0
+            if cam_spec.projection == "orthographic":
+                dir_cam = np.broadcast_to(np.array([[0.0, 0.0, -1.0]]), (w * h, 3))
+            else:
+                tan_y = math.tan(math.radians(cam_spec.fov_deg) * 0.5)
+                tan_x = tan_y * aspect
+                dir_cam = np.stack(
+                    [ndc_x * tan_x, ndc_y * tan_y, np.full_like(ndc_x, -1.0)], axis=1
+                )
+                dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True)
+            dirs_w = dir_cam @ c2w[:3, :3].T
+            dirs_w /= np.maximum(np.linalg.norm(dirs_w, axis=1, keepdims=True), 1e-12)
+            sun_dirs = [
+                (
+                    -np.asarray(o.light.direction or (-0.5, 0.4, -0.7), dtype=np.float64)
+                    / max(
+                        1e-9,
+                        float(
+                            np.linalg.norm(
+                                np.asarray(o.light.direction or (-0.5, 0.4, -0.7), dtype=np.float64)
+                            )
+                        ),
+                    ),
+                    np.asarray(o.light.color, dtype=np.float64) * float(o.light.intensity),
+                )
+                for o in scene.objects.values()
+                if o.kind == "light"
+                and o.light is not None
+                and o.light.kind == "sun"
+                and scene.is_object_visible(o)
+            ]
+            sky_lin = evaluate_world_sky(dirs_w, scene, sun_dirs)
+            bg = sky_lin.reshape((h, w, 3)).astype(np.float32)
         else:
+            y_frac = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+            zenith = np.asarray(scene.world.zenith_color, dtype=np.float32)[None, None, :]
+            horizon = np.asarray(scene.world.horizon_color, dtype=np.float32)[None, None, :]
             bg = zenith * (1.0 - y_frac) + horizon * y_frac
             bg = np.broadcast_to(bg, (h, w, 3)).copy()
-
-        hdr_mode = cfg.mode in ("pbr", "clay", "wireframe")
-        if hdr_mode:
-            bg = np.power(np.clip(bg, 0.0, 1.0), 2.2)
+            if hdr_mode:
+                bg = np.power(np.clip(bg, 0.0, 1.0), 2.2)
 
         # Gather flattened world triangles across all evaluated objects
         all_verts: list[np.ndarray] = []
@@ -516,6 +557,12 @@ class SoftwareRenderer:
                 roughness = np.full((n_px, 1), 0.5, dtype=np.float64)
                 ao_map = np.ones((n_px, 1), dtype=np.float64)
                 emission = np.zeros((n_px, 3), dtype=np.float64)
+                clearcoat = np.zeros((n_px, 1), dtype=np.float64)
+                clearcoat_roughness = np.full((n_px, 1), 0.08, dtype=np.float64)
+                sheen = np.zeros((n_px, 1), dtype=np.float64)
+                subsurface = np.zeros((n_px, 1), dtype=np.float64)
+                subsurface_color = np.zeros((n_px, 3), dtype=np.float64)
+                has_custom_sss_col = np.zeros((n_px, 1), dtype=bool)
                 shaded_nrm = nrm_oriented.copy()
 
                 if cfg.mode == "clay":
@@ -538,6 +585,15 @@ class SoftwareRenderer:
                         roughness[mask_m] = rgh_m
                         metallic[mask_m] = mtl_m
                         ao_map[mask_m] = ao_m
+                        clearcoat[mask_m] = float(mspec.clearcoat)
+                        clearcoat_roughness[mask_m] = float(mspec.clearcoat_roughness)
+                        sheen[mask_m] = float(mspec.sheen)
+                        subsurface[mask_m] = float(mspec.subsurface)
+                        if mspec.subsurface_color is not None:
+                            subsurface_color[mask_m] = np.power(
+                                np.clip(np.asarray(mspec.subsurface_color[:3]), 0.0, 1.0), 2.2
+                            )
+                            has_custom_sss_col[mask_m] = True
                         if mspec.emission_strength > 0:
                             emission[mask_m] = (
                                 np.asarray(mspec.emission_color[:3])[None, :]
@@ -547,6 +603,11 @@ class SoftwareRenderer:
                 # Convert UI sRGB albedo & emission into linear space for accurate PBR lighting
                 albedo_lin = np.power(np.clip(albedo, 0.0, 1.0), 2.2)
                 emission_lin = np.power(np.clip(emission, 0.0, 1.0), 2.2)
+                sss_col_arg = np.where(
+                    has_custom_sss_col,
+                    subsurface_color,
+                    np.clip(albedo_lin * np.array([[1.15, 0.62, 0.48]]), 0.0, 1.0),
+                )
 
                 # Collect visible lights
                 lights: list[tuple[SceneObject, LightSpec]] = []
@@ -603,29 +664,46 @@ class SoftwareRenderer:
                                 occ += (z_cmp > sz_sample).astype(np.float64)
                             sun_shadow_factor[idx_sm, 0] = 1.0 - 0.72 * (occ * 0.25)
 
-                # Hemisphere ambient lighting + analytic IBL reflection for metallic surfaces
-                hemi_t = 0.5 + 0.5 * shaded_nrm[:, 2:3]
-                sky_c = np.asarray(scene.world.zenith_color, dtype=np.float64)[None, :] * 1.6 + 0.16
-                gnd_c = (
-                    np.asarray(scene.world.horizon_color, dtype=np.float64)[None, :] * 0.75 + 0.06
-                )
-                amb_col = gnd_c * (1.0 - hemi_t) + sky_c * hemi_t
+                # Hemisphere ambient lighting + sky/HDRI-driven IBL reflections
+                if scene.world.sky_mode == "gradient":
+                    hemi_t = 0.5 + 0.5 * shaded_nrm[:, 2:3]
+                    sky_c = (
+                        np.power(np.clip(np.asarray(scene.world.zenith_color), 0.0, 1.0), 2.2)[
+                            None, :
+                        ]
+                        * 1.4
+                        + 0.12
+                    )
+                    gnd_c = (
+                        np.power(np.clip(np.asarray(scene.world.horizon_color), 0.0, 1.0), 2.2)[
+                            None, :
+                        ]
+                        * 0.75
+                        + 0.05
+                    )
+                    amb_col = gnd_c * (1.0 - hemi_t) + sky_c * hemi_t
+                else:
+                    amb_col = evaluate_world_sky(shaded_nrm, scene, []) * 0.75
 
                 ndv = np.clip(np.sum(shaded_nrm * view_dir, axis=1, keepdims=True), 0.0, 1.0)
                 f0 = 0.04 * (1.0 - metallic) + albedo_lin * metallic
-                fresnel = f0 + (1.0 - f0) * ((1.0 - ndv) ** 5)
+                fresnel = f0 + (1.0 - f0) * np.power(1.0 - ndv, 5.0)
+                coat_fresnel = 0.04 + 0.96 * np.power(1.0 - ndv, 5.0)
 
                 refl = 2.0 * np.sum(shaded_nrm * view_dir, axis=1, keepdims=True) * shaded_nrm
                 refl = refl - view_dir
-                refl_t = np.clip(0.5 + 0.5 * refl[:, 2:3], 0.0, 1.0)
-                env_refl = (
-                    np.array([[0.22, 0.24, 0.28]]) * (1.0 - refl_t)
-                    + np.array([[0.95, 0.96, 1.0]]) * refl_t
-                ) * (0.45 + 0.55 * (1.0 - roughness))
+                if scene.world.sky_mode == "gradient":
+                    refl_t = np.clip(0.5 + 0.5 * refl[:, 2:3], 0.0, 1.0)
+                    env_refl = (
+                        np.array([[0.22, 0.24, 0.28]]) * (1.0 - refl_t)
+                        + np.array([[0.95, 0.96, 1.0]]) * refl_t
+                    )
+                else:
+                    env_refl = evaluate_world_sky(refl, scene, [], studio_ibl=True)
+                env_refl = env_refl * (0.42 + 0.58 * (1.0 - roughness))
                 ibl_spec = (
-                    fresnel
+                    (fresnel * (0.15 + 0.75 * metallic) + clearcoat * coat_fresnel * 0.75)
                     * env_refl
-                    * (0.15 + 0.75 * metallic)
                     * (0.5 + scene.world.ambient_strength)
                     * ao_map
                 )
@@ -634,8 +712,6 @@ class SoftwareRenderer:
                     albedo_lin * amb_col * scene.world.ambient_strength * (1.0 - metallic) * ao_map
                     + ibl_spec
                 )
-
-                shininess = np.clip((1.0 - roughness) ** 2 * 180.0 + 4.0, 4.0, 256.0)
 
                 sun_used = False
                 for lobj, lspec in lights:
@@ -665,15 +741,21 @@ class SoftwareRenderer:
                             )
                             atten = atten * spot_mask
 
-                    ndl = np.clip(np.sum(shaded_nrm * l_vec, axis=1, keepdims=True), 0.0, 1.0)
-                    half_v = l_vec + view_dir
-                    hv_len = np.linalg.norm(half_v, axis=1, keepdims=True)
-                    half_v = half_v / np.where(hv_len < 1e-12, 1.0, hv_len)
-                    ndh = np.clip(np.sum(shaded_nrm * half_v, axis=1, keepdims=True), 0.0, 1.0)
-                    spec_pow = np.power(ndh, shininess) * (0.25 + 0.75 * (1.0 - roughness))
-                    diff = albedo_lin * (1.0 - metallic) * ndl
-                    spec = fresnel * spec_pow * ndl * 1.4
-                    total_light += (diff + spec) * lcol * atten
+                    brdf = evaluate_ggx_brdf(
+                        shaded_nrm,
+                        view_dir,
+                        l_vec,
+                        albedo_lin,
+                        roughness,
+                        metallic,
+                        f0,
+                        clearcoat=clearcoat,
+                        clearcoat_roughness=clearcoat_roughness,
+                        sheen=sheen,
+                        subsurface=subsurface,
+                        subsurface_color=sss_col_arg,
+                    )
+                    total_light += brdf * lcol * atten
 
                 shaded = total_light + emission_lin
 

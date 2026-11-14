@@ -499,8 +499,20 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
             float, Field(ge=-1.0, le=1.0, description="Loop cut slide offset (-1..1).")
         ] = 0.0,
         smooth_subdiv: Annotated[
-            bool, Field(description="Use Loop smoothing during whole-mesh subdivision.")
+            bool, Field(description="Use smooth subdivision during whole-mesh subdivide.")
         ] = True,
+        subdiv_mode: Annotated[
+            Literal["catmull_clark", "loop", "simple"],
+            Field(description="Whole-mesh subdivision algorithm."),
+        ] = "catmull_clark",
+        crease_angle_deg: Annotated[
+            float,
+            Field(
+                ge=1.0,
+                le=180.0,
+                description="Crease angle threshold (deg) kept sharp in Catmull-Clark.",
+            ),
+        ] = 180.0,
         individual: Annotated[
             bool, Field(description="Extrude or inset each selected face individually.")
         ] = False,
@@ -554,13 +566,27 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
             Field(description="Mirror direction for symmetrize."),
         ] = "-x_to_+x",
         projection: Annotated[
-            Literal["box", "planar_x", "planar_y", "planar_z", "cylindrical", "spherical"],
+            Literal[
+                "box",
+                "smart_uv",
+                "planar_x",
+                "planar_y",
+                "planar_z",
+                "cylindrical",
+                "spherical",
+            ],
             Field(description="UV projection method for project_uvs."),
         ] = "box",
         uv_scale: Annotated[Vec2, Field(description="UV tiling scale for project_uvs.")] = (
             1.0,
             1.0,
         ),
+        uv_angle_limit_deg: Annotated[
+            float, Field(ge=5.0, le=180.0, description="Smart UV island angle threshold (deg).")
+        ] = 66.0,
+        island_margin: Annotated[
+            float, Field(ge=0.0, le=0.25, description="Margin between packed UV islands.")
+        ] = 0.02,
         flip_normals_flag: Annotated[
             bool, Field(description="Flip winding on duplicated faces.")
         ] = False,
@@ -663,6 +689,8 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
                     cuts=cuts,
                     slide=slide,
                     smooth_subdiv=smooth_subdiv,
+                    subdiv_mode=subdiv_mode,
+                    crease_angle_deg=crease_angle_deg,
                     individual=individual,
                     along_normals=along_normals,
                     direction=direction,
@@ -687,6 +715,8 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
                     symmetrize_direction=symmetrize_direction,
                     projection=projection,
                     uv_scale=uv_scale,
+                    uv_angle_limit_deg=uv_angle_limit_deg,
+                    island_margin=island_margin,
                     flip_normals_flag=flip_normals_flag,
                     inside=inside,
                     offset=offset,

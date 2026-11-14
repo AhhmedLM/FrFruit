@@ -49,6 +49,8 @@ class SubdivisionModifier(BaseModel):
     enabled: bool = True
     levels: int = Field(default=1, ge=1, le=3)
     smooth: bool = True
+    algorithm: Literal["catmull_clark", "loop", "simple"] = "catmull_clark"
+    crease_angle_deg: float = Field(default=180.0, ge=0.0, le=180.0)
 
 
 class BevelModifier(BaseModel):
@@ -141,6 +143,11 @@ class MaterialSpec(BaseModel):
     emission_strength: float = Field(default=0.0, ge=0.0)
     alpha: float = Field(default=1.0, ge=0.0, le=1.0)
     ior: float = Field(default=1.45, ge=1.0, le=3.0)
+    clearcoat: float = Field(default=0.0, ge=0.0, le=1.0)
+    clearcoat_roughness: float = Field(default=0.08, ge=0.01, le=1.0)
+    sheen: float = Field(default=0.0, ge=0.0, le=1.0)
+    subsurface: float = Field(default=0.0, ge=0.0, le=1.0)
+    subsurface_color: ColorRGB | None = None
     pattern: Literal["solid", "checker", "gradient", "wood", "noise"] = "solid"
     secondary_color: ColorRGBA = (0.2, 0.2, 0.25, 1.0)
     pattern_scale: float = Field(default=4.0, gt=0.0)
@@ -180,18 +187,27 @@ class CameraSpec(BaseModel):
 
 
 class WorldEnvironment(BaseModel):
-    """World sky/background and global ambient illumination."""
+    """World sky/background, physical atmosphere / HDRI IBL, and global ambient illumination."""
 
     background_color: ColorRGB = (0.14, 0.16, 0.20)
     horizon_color: ColorRGB = (0.22, 0.25, 0.30)
     zenith_color: ColorRGB = (0.09, 0.12, 0.18)
     ambient_strength: float = Field(default=0.32, ge=0.0, le=2.0)
+    sky_mode: Literal["gradient", "physical_sky", "hdri"] = "gradient"
+    hdri_path: str | None = None
+    hdri_rotation_deg: float = 0.0
+    hdri_intensity: float = Field(default=1.0, ge=0.0, le=20.0)
+    sun_elevation_deg: float = Field(default=35.0, ge=-15.0, le=90.0)
+    sun_azimuth_deg: float = Field(default=135.0, ge=-360.0, le=360.0)
+    air_turbidity: float = Field(default=2.2, ge=1.0, le=10.0)
 
 
 class PostProcessConfig(BaseModel):
     """Post-processing compositing stack applied to PBR and path-traced renders."""
 
     enabled: bool = True
+    denoise_enabled: bool = True
+    denoise_strength: float = Field(default=0.65, ge=0.0, le=1.0)
     tone_mapper: Literal["aces", "filmic", "reinhard", "none"] = "aces"
     exposure: float = Field(default=0.0, ge=-5.0, le=5.0)
     bloom_enabled: bool = True
@@ -254,10 +270,21 @@ class BoneSpec(BaseModel):
     rotation_deg: Vec3 = (0.0, 0.0, 0.0)
 
 
+class IKConstraintSpec(BaseModel):
+    """Inverse Kinematics solver target attached to a tip bone in an armature."""
+
+    bone_name: str
+    target: Vec3
+    chain_length: int = Field(default=2, ge=1, le=16)
+    pole_target: Vec3 | None = None
+    iterations: int = Field(default=16, ge=1, le=64)
+
+
 class ArmatureSpec(BaseModel):
     """Skeletal rig hierarchy for game-ready character and mechanical animation."""
 
     bones: list[BoneSpec] = Field(default_factory=list)
+    ik_targets: list[IKConstraintSpec] = Field(default_factory=list)
 
 
 class SkinWeightSpec(BaseModel):

@@ -214,3 +214,115 @@ def test_pathtracer_renders_shadows_reflections_refraction_and_modes() -> None:
             sc, width=160, height=120, mode=diag, engine="raytrace", samples=1
         )
         assert Image.open(io.BytesIO(png_d)).size == (160, 120)
+
+
+def test_physical_sky_hdri_ggx_coat_sheen_sss_and_bilateral_denoiser(tmp_path) -> None:
+    from frfruit.render.postprocess import denoise_image
+    from frfruit.render.sky import (
+        evaluate_physical_sky,
+        evaluate_world_sky,
+        sun_direction_from_angles,
+    )
+
+    # 1. Edge-aware denoiser cuts flat noise while preserving crisp step edges
+    h, w = 64, 64
+    clean = np.full((h, w, 3), 0.15, dtype=np.float32)
+    clean[:, 32:] = 0.85
+    rng = np.random.default_rng(7)
+    noisy = np.clip(clean + rng.normal(0.0, 0.08, size=clean.shape), 0.0, 2.0).astype(np.float32)
+    albedo = clean.copy()
+    normal = np.zeros((h, w, 3), dtype=np.float32)
+    normal[:, :32, 2] = 1.0
+    normal[:, 32:, 0] = 1.0
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    depth[:, 32:] = 2.0
+
+    den = denoise_image(noisy, albedo_buf=albedo, normal_buf=normal, depth_buf=depth, strength=0.85)
+    assert float(den[:, :28].std()) < float(noisy[:, :28].std()) * 0.55
+    # Edge contrast across x=32 boundary remains sharp
+    edge_jump = float(den[:, 35:].mean() - den[:, :29].mean())
+    assert edge_jump > 0.55
+
+    # 2. Physical sky sunset vs noon changes horizon color warmth dramatically
+    dirs = np.array([[1.0, 0.0, 0.05], [0.0, 0.0, 0.95]], dtype=np.float64)
+    sunset = evaluate_physical_sky(dirs, sun_direction_from_angles(4.0, 0.0), turbidity=3.2)
+    noon = evaluate_physical_sky(dirs, sun_direction_from_angles(65.0, 0.0), turbidity=2.0)
+    # Sunset horizon has higher red/blue ratio than high-noon blue zenith
+    assert (sunset[0, 0] / max(1e-5, sunset[0, 2])) > (noon[1, 0] / max(1e-5, noon[1, 2]))
+
+    # 3. Equirectangular HDRI loading & rotation
+    hdri_img = Image.new("RGB", (64, 32), (30, 80, 220))
+    # Bright warm spot on right side (+U)
+    for x in range(44, 60):
+        for y in range(8, 24):
+            hdri_img.putpixel((x, y), (255, 220, 140))
+    hdri_path = tmp_path / "env.png"
+    hdri_img.save(hdri_path)
+
+    sc = SceneDocument.new_default("GGXSky")
+    sc.world.sky_mode = "hdri"
+    sc.world.hdri_path = str(hdri_path)
+    sc.world.hdri_intensity = 1.5
+    test_dirs = np.array([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]], dtype=np.float64)
+    s0 = evaluate_world_sky(test_dirs, sc, [])
+    sc.world.hdri_rotation_deg = 180.0
+    s180 = evaluate_world_sky(test_dirs, sc, [])
+    assert not np.allclose(s0, s180)
+    assert s0[0, 0] > s0[1, 0] and s180[1, 0] > s180[0, 0]
+
+    # 4. Physical sky + clearcoat/sheen/subsurface materials render cleanly in software & raytrace
+    sc.world.sky_mode = "physical_sky"
+    sc.world.sun_elevation_deg = 22.0
+    sc.materials["mat_coat"] = MaterialSpec(
+        id="mat_coat",
+        name="CarPaint",
+        base_color=(0.75, 0.05, 0.08, 1.0),
+        metallic=0.2,
+        roughness=0.35,
+        clearcoat=0.95,
+        clearcoat_roughness=0.04,
+    )
+    sc.materials["mat_velvet"] = MaterialSpec(
+        id="mat_velvet",
+        name="Velvet",
+        base_color=(0.15, 0.25, 0.65, 1.0),
+        roughness=0.82,
+        sheen=0.9,
+    )
+    sc.materials["mat_skin"] = MaterialSpec(
+        id="mat_skin",
+        name="JadeSSS",
+        base_color=(0.25, 0.72, 0.45, 1.0),
+        roughness=0.30,
+        subsurface=0.75,
+        subsurface_color=(0.45, 0.95, 0.55),
+    )
+    sphere = create_primitive_mesh("uv_sphere", radius=0.55, segments=16)
+    sc.objects["s1"] = SceneObject(
+        id="s1",
+        name="CoatSphere",
+        kind="mesh",
+        transform=Transform(location=(-1.1, 0.0, 0.6)),
+        mesh=sphere.to_payload(),
+        material_id="mat_coat",
+    )
+    sc.objects["s2"] = SceneObject(
+        id="s2",
+        name="VelvetSphere",
+        kind="mesh",
+        transform=Transform(location=(0.0, 0.0, 0.6)),
+        mesh=sphere.to_payload(),
+        material_id="mat_velvet",
+    )
+    sc.objects["s3"] = SceneObject(
+        id="s3",
+        name="SSSSphere",
+        kind="mesh",
+        transform=Transform(location=(1.1, 0.0, 0.6)),
+        mesh=sphere.to_payload(),
+        material_id="mat_skin",
+    )
+    for eng in ("software", "raytrace"):
+        png_b, _ = render_single_view(sc, width=180, height=135, mode="pbr", engine=eng, samples=2)
+        arr = np.asarray(Image.open(io.BytesIO(png_b)))
+        assert arr.shape == (135, 180, 3) and arr.std() > 10.0

@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import math
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from frfruit.core.math3d import compose_matrix, transform_points
+from frfruit.core.math3d import (
+    compose_matrix,
+    decompose_matrix,
+    euler_deg_to_matrix,
+    transform_points,
+)
 
 if TYPE_CHECKING:
     from frfruit.core.scene import ArmatureSpec, BoneSpec, SceneObject, SkinWeightSpec
+    from frfruit.core.types import Vec3
     from frfruit.geometry.mesh import MeshData
 
 
@@ -186,3 +193,257 @@ def deform_skinned_mesh(
     out = local_mesh.copy()
     out.vertices = deformed_local
     return out
+
+
+def _rotation_between_vectors(
+    src: np.ndarray,
+    dst: np.ndarray,
+    fallback_axis: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute shortest-arc 3x3 rotation matrix mapping unit vector `src` to `dst`."""
+    u = src / max(1e-12, float(np.linalg.norm(src)))
+    v = dst / max(1e-12, float(np.linalg.norm(dst)))
+    dot = max(-1.0, min(1.0, float(np.dot(u, v))))
+    if dot > 1.0 - 1e-10:
+        return np.eye(3, dtype=np.float64)
+    if dot < -1.0 + 1e-10:
+        axis = (
+            fallback_axis.copy()
+            if fallback_axis is not None and float(np.linalg.norm(fallback_axis)) > 1e-8
+            else np.cross(u, np.array([1.0, 0.0, 0.0], dtype=np.float64))
+        )
+        if float(np.linalg.norm(axis)) < 1e-8:
+            axis = np.cross(u, np.array([0.0, 1.0, 0.0], dtype=np.float64))
+        axis /= max(1e-12, float(np.linalg.norm(axis)))
+        kx, ky, kz = float(axis[0]), float(axis[1]), float(axis[2])
+        k_mat = np.array(
+            [[0.0, -kz, ky], [kz, 0.0, -kx], [-ky, kx, 0.0]],
+            dtype=np.float64,
+        )
+        return np.eye(3, dtype=np.float64) + 2.0 * (k_mat @ k_mat)
+
+    c = np.cross(u, v)
+    kx, ky, kz = float(c[0]), float(c[1]), float(c[2])
+    k_mat = np.array(
+        [[0.0, -kz, ky], [kz, 0.0, -kx], [-ky, kx, 0.0]],
+        dtype=np.float64,
+    )
+    return np.eye(3, dtype=np.float64) + k_mat + (k_mat @ k_mat) * (1.0 / (1.0 + dot))
+
+
+def solve_armature_ik(
+    armature: ArmatureSpec,
+    tip_bone: str,
+    target_pos: Vec3,
+    chain_length: int = 2,
+    pole_target: Vec3 | None = None,
+    iterations: int = 16,
+    save_constraint: bool = True,
+) -> dict[str, Any]:
+    """Solve Inverse Kinematics for a bone chain using FABRIK + optional pole target.
+
+    Modifies `bone.rotation_deg` in place for bones in the solved chain so the tip bone's
+    tail moves toward `target_pos` (in armature space). Optionally stores/updates the
+    `IKConstraintSpec` on `armature.ik_targets`.
+    """
+    from frfruit.core.scene import IKConstraintSpec
+
+    bones_by_name: dict[str, BoneSpec] = {b.name: b for b in armature.bones}
+    if tip_bone not in bones_by_name:
+        raise KeyError(f"Bone {tip_bone!r} not found in armature.")
+
+    clen = max(1, int(chain_length))
+    chain_rev: list[BoneSpec] = []
+    cur: BoneSpec | None = bones_by_name[tip_bone]
+    seen: set[str] = set()
+    while cur is not None and len(chain_rev) < clen and cur.name not in seen:
+        chain_rev.append(cur)
+        seen.add(cur.name)
+        cur = bones_by_name.get(cur.parent) if cur.parent else None
+    chain = list(reversed(chain_rev))
+    k = len(chain)
+
+    _, pose_mats, _ = compute_armature_matrices(armature)
+
+    # Joint positions P[0..k] in armature space, and bone local rest vectors v_rest[0..k-1]
+    pts: list[np.ndarray] = [pose_mats[b.name][:3, 3].copy() for b in chain]
+    v_rest: list[np.ndarray] = []
+    for i in range(k - 1):
+        b_cur, b_nxt = chain[i], chain[i + 1]
+        vec = (
+            np.asarray(b_nxt.head, dtype=np.float64) - np.asarray(b_cur.head, dtype=np.float64)
+        ) + np.asarray(b_nxt.translation, dtype=np.float64)
+        v_rest.append(vec)
+    tip_b = chain[-1]
+    tip_vec = np.asarray(tip_b.tail, dtype=np.float64) - np.asarray(tip_b.head, dtype=np.float64)
+    v_rest.append(tip_vec)
+    pts.append(pts[-1] + pose_mats[tip_b.name][:3, :3] @ tip_vec)
+
+    lengths = [float(np.linalg.norm(v)) for v in v_rest]
+    total_len = sum(lengths)
+    root_pos = pts[0].copy()
+    target = np.asarray(target_pos, dtype=np.float64)
+    to_target = target - root_pos
+    dist_target = float(np.linalg.norm(to_target))
+
+    pole_vec_np = np.asarray(pole_target, dtype=np.float64) if pole_target is not None else None
+
+    def _compute_pole_dir(axis_dir: np.ndarray) -> np.ndarray | None:
+        if pole_vec_np is None:
+            return None
+        pv = pole_vec_np - root_pos
+        perp = pv - float(np.dot(pv, axis_dir)) * axis_dir
+        nrm = float(np.linalg.norm(perp))
+        if nrm > 1e-6:
+            return perp / nrm
+        return None
+
+    if total_len < 1e-8:
+        return {
+            "chain_bones": [b.name for b in chain],
+            "tip_bone": tip_bone,
+            "target": [float(target[0]), float(target[1]), float(target[2])],
+            "achieved_tip": [float(pts[-1][0]), float(pts[-1][1]), float(pts[-1][2])],
+            "error": float(np.linalg.norm(pts[-1] - target)),
+            "target_achieved": False,
+            "rotations_deg": {b.name: list(b.rotation_deg) for b in chain},
+        }
+
+    if dist_target >= total_len - 1e-6:
+        # Target is out of reach or exact max extension: align chain straight toward target
+        d_dir = (
+            to_target / max(1e-12, dist_target)
+            if dist_target > 1e-9
+            else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        )
+        pts[0] = root_pos.copy()
+        for i in range(k):
+            pts[i + 1] = pts[i] + d_dir * lengths[i]
+    else:
+        axis_dir = (
+            to_target / max(1e-12, dist_target)
+            if dist_target > 1e-9
+            else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        )
+        pole_dir = _compute_pole_dir(axis_dir)
+
+        # Break collinear singularities so 2+ bone chains bend gracefully toward pole / mid normal
+        if k >= 2:
+            if pole_dir is not None:
+                bend_dir = pole_dir
+            else:
+                ref = (
+                    np.array([0.0, 1.0, 0.0], dtype=np.float64)
+                    if abs(float(axis_dir[1])) < 0.9
+                    else np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                )
+                bend_dir = np.cross(axis_dir, ref)
+                bend_dir /= max(1e-12, float(np.linalg.norm(bend_dir)))
+
+            # Check if intermediate joints are nearly collinear with axis_dir
+            max_perp = 0.0
+            for i in range(1, k):
+                rel = pts[i] - root_pos
+                perp = rel - float(np.dot(rel, axis_dir)) * axis_dir
+                max_perp = max(max_perp, float(np.linalg.norm(perp)))
+            if max_perp < 1e-4 * total_len:
+                for i in range(1, k):
+                    pts[i] = pts[i] + bend_dir * (0.08 * total_len * math.sin(math.pi * i / k))
+
+        n_iters = max(1, int(iterations))
+        for it in range(n_iters):
+            # Project interior joints onto the pole half-plane BEFORE final FABRIK snaps
+            if pole_dir is not None and k >= 2:
+                for i in range(1, k):
+                    rel = pts[i] - root_pos
+                    t_ax = float(np.dot(rel, axis_dir))
+                    rad = float(np.linalg.norm(rel - t_ax * axis_dir))
+                    pts[i] = root_pos + t_ax * axis_dir + max(rad, 1e-4 * total_len) * pole_dir
+
+            # Forward reaching pass (tip -> root)
+            pts[k] = target.copy()
+            for i in range(k - 1, -1, -1):
+                seg = pts[i] - pts[i + 1]
+                slen = float(np.linalg.norm(seg))
+                if slen > 1e-12:
+                    pts[i] = pts[i + 1] + (seg / slen) * lengths[i]
+                else:
+                    pts[i] = pts[i + 1] + np.array([0.0, 0.0, -lengths[i]], dtype=np.float64)
+
+            # Backward reaching pass (root -> tip)
+            pts[0] = root_pos.copy()
+            for i in range(k):
+                seg = pts[i + 1] - pts[i]
+                slen = float(np.linalg.norm(seg))
+                if slen > 1e-12:
+                    pts[i + 1] = pts[i] + (seg / slen) * lengths[i]
+                else:
+                    pts[i + 1] = pts[i] + np.array([0.0, 0.0, lengths[i]], dtype=np.float64)
+
+            if float(np.linalg.norm(pts[k] - target)) < 1e-5 and it >= 2:
+                break
+
+    # Recover local bone rotation_deg via sequential Forward Kinematics alignment
+    root_parent = chain[0].parent
+    parent_r = (
+        pose_mats[root_parent][:3, :3].copy()
+        if root_parent and root_parent in pose_mats
+        else np.eye(3, dtype=np.float64)
+    )
+    pole_fallback = _compute_pole_dir(
+        to_target / max(1e-12, dist_target)
+        if dist_target > 1e-9
+        else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    )
+
+    rotations_out: dict[str, list[float]] = {}
+    for i, bone in enumerate(chain):
+        desired_w = pts[i + 1] - pts[i]
+        d_len = float(np.linalg.norm(desired_w))
+        v_len = lengths[i]
+        if d_len > 1e-10 and v_len > 1e-10:
+            v_loc_dir = v_rest[i] / v_len
+            d_loc_dir = parent_r.T @ (desired_w / d_len)
+            fb_loc = parent_r.T @ pole_fallback if pole_fallback is not None else None
+            r_loc = _rotation_between_vectors(v_loc_dir, d_loc_dir, fallback_axis=fb_loc)
+            mat4 = np.eye(4, dtype=np.float64)
+            mat4[:3, :3] = r_loc
+            _, rot_deg, _ = decompose_matrix(mat4)
+            bone.rotation_deg = (float(rot_deg[0]), float(rot_deg[1]), float(rot_deg[2]))
+            parent_r = parent_r @ euler_deg_to_matrix(*bone.rotation_deg)
+        rotations_out[bone.name] = [round(v, 4) for v in bone.rotation_deg]
+
+    # Re-evaluate armature matrices to report exact achieved tip & residual error
+    _, final_pose, _ = compute_armature_matrices(armature)
+    achieved = (final_pose[tip_b.name] @ np.array([tip_vec[0], tip_vec[1], tip_vec[2], 1.0]))[:3]
+    err = float(np.linalg.norm(achieved - target))
+
+    if save_constraint:
+        spec = IKConstraintSpec(
+            bone_name=tip_bone,
+            target=(float(target[0]), float(target[1]), float(target[2])),
+            chain_length=clen,
+            pole_target=pole_target,
+            iterations=max(1, int(iterations)),
+        )
+        updated = [c for c in armature.ik_targets if c.bone_name != tip_bone]
+        updated.append(spec)
+        armature.ik_targets = updated
+
+    return {
+        "chain_bones": [b.name for b in chain],
+        "tip_bone": tip_bone,
+        "target": [
+            round(float(target[0]), 5),
+            round(float(target[1]), 5),
+            round(float(target[2]), 5),
+        ],
+        "achieved_tip": [
+            round(float(achieved[0]), 5),
+            round(float(achieved[1]), 5),
+            round(float(achieved[2]), 5),
+        ],
+        "error": round(err, 6),
+        "target_achieved": err <= 1e-2 or dist_target >= total_len - 1e-6,
+        "rotations_deg": rotations_out,
+    }

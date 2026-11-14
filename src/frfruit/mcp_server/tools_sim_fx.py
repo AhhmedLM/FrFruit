@@ -5,13 +5,19 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
+import numpy as np
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from frfruit.animation.armature import auto_rig_mesh, compute_armature_matrices
+from frfruit.animation.armature import (
+    auto_rig_mesh,
+    compute_armature_matrices,
+    solve_armature_ik,
+)
 from frfruit.animation.timeline import FCurveTrack, Keyframe
+from frfruit.core.math3d import transform_points
 from frfruit.core.scene import (
     ArmatureSpec,
     BoneSpec,
@@ -246,6 +252,13 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
         enabled: Annotated[
             bool | None, Field(description="Master toggle for post-processing.")
         ] = None,
+        denoise_enabled: Annotated[
+            bool | None,
+            Field(description="Enable edge-aware bilateral denoiser on raytraced renders."),
+        ] = None,
+        denoise_strength: Annotated[
+            float | None, Field(ge=0.0, le=1.0, description="Denoiser smoothing strength.")
+        ] = None,
         tone_mapper: Annotated[
             Literal["aces", "filmic", "reinhard", "none"] | None,
             Field(description="HDR tone-mapping operator."),
@@ -271,7 +284,7 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
         ] = None,
         sharpen: Annotated[float | None, Field(ge=0.0, le=1.0)] = None,
     ) -> dict[str, Any]:
-        """Inspect/update HDR post-processing (Bloom, SSAO, DOF, ACES) and render engine."""
+        """Inspect/update HDR post-processing (Denoiser, Bloom, SSAO, DOF, ACES) & engine."""
         sess = get_session()
         with sess.lock:
             if action == "get":
@@ -299,6 +312,8 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                     k: v
                     for k, v in {
                         "enabled": enabled,
+                        "denoise_enabled": denoise_enabled,
+                        "denoise_strength": denoise_strength,
                         "tone_mapper": tone_mapper,
                         "exposure": exposure,
                         "bloom_enabled": bloom_enabled,
@@ -543,8 +558,16 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
     )
     def armature_rig(
         action: Annotated[
-            Literal["create", "add_bone", "auto_rig", "set_pose", "keyframe_pose", "list"],
-            Field(description="Skeletal rig creation, auto-skinning, posing, or bone keyframing."),
+            Literal[
+                "create",
+                "add_bone",
+                "auto_rig",
+                "set_pose",
+                "solve_ik",
+                "keyframe_pose",
+                "list",
+            ],
+            Field(description="Skeletal rig creation, auto-skinning, FK/IK posing, or keyframing."),
         ],
         armature_id: Annotated[str | None, Field(description="Armature object ID or name.")] = None,
         name: Annotated[str | None, Field(description="Name for new armature object.")] = None,
@@ -558,7 +581,7 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
             ),
         ] = None,
         bone_name: Annotated[
-            str | None, Field(description="Bone name for add/pose/keyframe.")
+            str | None, Field(description="Bone name for add/pose/solve_ik/keyframe.")
         ] = None,
         parent_bone: Annotated[str | None, Field(description="Optional parent bone name.")] = None,
         head: Annotated[Vec3 | None, Field(description="Bone rest head XYZ.")] = None,
@@ -571,11 +594,23 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
             Vec3 | None, Field(description="Bone pose Euler XYZ degrees.")
         ] = None,
         translation: Annotated[Vec3 | None, Field(description="Bone pose translation XYZ.")] = None,
+        target_pos: Annotated[
+            Vec3 | None, Field(description="World-space IK target XYZ for solve_ik.")
+        ] = None,
+        chain_length: Annotated[
+            int, Field(ge=1, le=16, description="Bone chain depth for solve_ik.")
+        ] = 2,
+        pole_target: Annotated[
+            Vec3 | None, Field(description="Optional world-space pole vector target for solve_ik.")
+        ] = None,
+        ik_iterations: Annotated[
+            int, Field(ge=1, le=64, description="FABRIK solver iterations for solve_ik.")
+        ] = 16,
         frame: Annotated[
-            int | None, Field(description="Keyframe number for keyframe_pose.")
+            int | None, Field(description="Keyframe number for keyframe_pose or solve_ik.")
         ] = None,
     ) -> dict[str, Any]:
-        """Create skeletal armatures, auto-skin meshes, pose bones, and keyframe poses."""
+        """Create armatures, auto-skin meshes, pose FK/IK chains, and keyframe bone poses."""
         sess = get_session()
         with sess.lock:
             if action == "list":
@@ -585,6 +620,7 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                         "name": o.name,
                         "location": list(o.transform.location),
                         "bones": [b.model_dump() for b in o.armature.bones],
+                        "ik_targets": [c.model_dump() for c in o.armature.ik_targets],
                     }
                     for o in sess.scene.objects.values()
                     if o.kind == "armature" and o.armature is not None
@@ -668,12 +704,79 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                     "bones_weighted": {b: len(w) for b, w in skin.weights.items() if w},
                 }
 
-            # set_pose / keyframe_pose
+            # set_pose / solve_ik / keyframe_pose
             if not bone_name:
                 raise ToolError(f"bone_name is required for action={action!r}.")
             target_bone = next((b for b in arm_obj.armature.bones if b.name == bone_name), None)
             if target_bone is None:
                 raise ToolError(f"Bone {bone_name!r} not found on {arm_obj.name!r}.")
+
+            if action == "solve_ik":
+                if target_pos is None:
+                    raise ToolError("target_pos is required for action='solve_ik'.")
+                sess.push_history(f"solve_ik:{bone_name}")
+                arm_inv = np.linalg.inv(compute_world_matrix(sess.scene, arm_obj.id))
+                t_arm_arr = transform_points(arm_inv, np.asarray([target_pos], dtype=np.float64))[0]
+                t_arm: Vec3 = (float(t_arm_arr[0]), float(t_arm_arr[1]), float(t_arm_arr[2]))
+                p_arm: Vec3 | None = None
+                if pole_target is not None:
+                    p_arr = transform_points(arm_inv, np.asarray([pole_target], dtype=np.float64))[
+                        0
+                    ]
+                    p_arm = (float(p_arr[0]), float(p_arr[1]), float(p_arr[2]))
+
+                ik_res = solve_armature_ik(
+                    arm_obj.armature,
+                    tip_bone=bone_name,
+                    target_pos=t_arm,
+                    chain_length=chain_length,
+                    pole_target=p_arm,
+                    iterations=ik_iterations,
+                )
+
+                tracks_added: list[str] = []
+                if frame is not None:
+                    tl = sess.scene.timeline
+                    bones_map = {b.name: b for b in arm_obj.armature.bones}
+                    for cb_name in ik_res["chain_bones"]:
+                        cb_bone = bones_map[cb_name]
+                        for idx, ax in enumerate(("x", "y", "z")):
+                            pp = f"bone.{cb_name}.rotation_deg.{ax}"
+                            tr = next(
+                                (
+                                    t
+                                    for t in tl.tracks
+                                    if t.target_id == arm_obj.id and t.property_path == pp
+                                ),
+                                None,
+                            )
+                            if tr is None:
+                                tr = FCurveTrack(target_id=arm_obj.id, property_path=pp)
+                                tl.tracks.append(tr)
+                            tr.keyframes = [k for k in tr.keyframes if k.frame != frame]
+                            tr.keyframes.append(
+                                Keyframe(
+                                    frame=frame,
+                                    value=float(cb_bone.rotation_deg[idx]),
+                                    interpolation="bezier",
+                                )
+                            )
+                            tr.keyframes.sort(key=lambda k: k.frame)
+                            tracks_added.append(pp)
+
+                sess.notify(
+                    "armature_ik_solved",
+                    {"armature_id": arm_obj.id, "bone": bone_name, "error": ik_res["error"]},
+                )
+                out_ik: dict[str, Any] = {
+                    "status": "ok",
+                    "armature_id": arm_obj.id,
+                    "ik_result": ik_res,
+                }
+                if tracks_added:
+                    out_ik["frame"] = frame
+                    out_ik["tracks"] = tracks_added
+                return out_ik
 
             if action == "set_pose":
                 sess.push_history(f"pose:{bone_name}")
@@ -694,7 +797,7 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                 raise ToolError("frame is required for action='keyframe_pose'.")
             sess.push_history(f"keyframe_pose:{bone_name}@{frame}")
             tl = sess.scene.timeline
-            tracks_added: list[str] = []
+            tracks_added = []
             for prop, vec in (("rotation_deg", rotation_deg), ("translation", translation)):
                 if vec is None:
                     continue

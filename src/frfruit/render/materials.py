@@ -205,3 +205,92 @@ def evaluate_material_maps(
             ao = np.clip(tex_ao[:, 0:1], 0.1, 1.0)
 
     return albedo, nrm_out, roughness, metallic, ao
+
+
+def evaluate_ggx_brdf(
+    nrm: np.ndarray,
+    view_dir: np.ndarray,
+    light_dir: np.ndarray,
+    albedo_lin: np.ndarray,
+    roughness: np.ndarray,
+    metallic: np.ndarray,
+    f0: np.ndarray,
+    *,
+    clearcoat: np.ndarray | float = 0.0,
+    clearcoat_roughness: np.ndarray | float = 0.08,
+    sheen: np.ndarray | float = 0.0,
+    subsurface: np.ndarray | float = 0.0,
+    subsurface_color: np.ndarray | None = None,
+) -> np.ndarray:
+    """Evaluate physically plausible GGX Cook-Torrance BRDF + Clearcoat + Sheen + Subsurface."""
+    ndl_raw = np.sum(nrm * light_dir, axis=1, keepdims=True)
+    ndl = np.clip(ndl_raw, 0.0, 1.0)
+    ndv = np.clip(np.sum(nrm * view_dir, axis=1, keepdims=True), 1e-4, 1.0)
+
+    half_v = light_dir + view_dir
+    hv_len = np.linalg.norm(half_v, axis=1, keepdims=True)
+    half_v = half_v / np.where(hv_len < 1e-12, 1.0, hv_len)
+    ndh = np.clip(np.sum(nrm * half_v, axis=1, keepdims=True), 0.0, 1.0)
+    vdh = np.clip(np.sum(view_dir * half_v, axis=1, keepdims=True), 0.0, 1.0)
+
+    # Trowbridge-Reitz GGX NDF
+    r_clamped = np.clip(roughness, 0.04, 1.0)
+    alpha = r_clamped * r_clamped
+    a2 = alpha * alpha
+    d_denom = ndh * ndh * (a2 - 1.0) + 1.0
+    d_ggx = a2 / np.maximum(math.pi * d_denom * d_denom, 1e-6)
+
+    # Smith-Schlick GGX visibility/geometry
+    k_g = ((r_clamped + 1.0) ** 2) * 0.125
+    g_v = ndv / (ndv * (1.0 - k_g) + k_g)
+    g_l = ndl / np.maximum(ndl * (1.0 - k_g) + k_g, 1e-5)
+    g_smith = g_v * g_l
+
+    # Schlick Fresnel
+    f_schlick = f0 + (1.0 - f0) * np.power(1.0 - vdh, 5.0)
+
+    # Cook-Torrance specular lobe (bounded cleanly to suppress extreme grazing fireflies)
+    spec = (d_ggx * g_smith * f_schlick) / np.maximum(4.0 * ndv * ndl, 1e-3)
+    spec = np.minimum(spec, 8.0)
+
+    # Energy-conserving Lambertian diffuse
+    kd = (1.0 - f_schlick) * (1.0 - metallic)
+    diff = kd * albedo_lin * (1.0 / math.pi) * 2.2
+
+    # Optional Subsurface wrap scattering for skin/wax/foliage/marble
+    if np.any(subsurface > 1e-4):
+        wrap_ndl = np.clip((ndl_raw + 0.55) / 1.55, 0.0, 1.0)
+        sss_tint = (
+            subsurface_color
+            if subsurface_color is not None
+            else np.clip(albedo_lin * np.array([[1.15, 0.62, 0.48]]), 0.0, 1.0)
+        )
+        diff = diff * (1.0 - 0.65 * subsurface) + kd * sss_tint * wrap_ndl * subsurface * 0.85
+
+    # Optional Grazing Fabric Sheen (retro-reflective velvet rim)
+    sheen_term = 0.0
+    if np.any(sheen > 1e-4):
+        sheen_tint = 0.65 + 0.35 * albedo_lin
+        grazing = np.power(1.0 - ndv, 4.0) + 0.35 * np.power(1.0 - ndh, 3.0)
+        sheen_term = sheen * sheen_tint * grazing * (0.25 + 0.75 * ndl) * 0.6
+
+    # Optional Dielectric Clearcoat second specular lobe (IOR ~ 1.5 -> F0 = 0.04)
+    coat_spec = 0.0
+    coat_atten = 1.0
+    if np.any(clearcoat > 1e-4):
+        rc = np.clip(clearcoat_roughness, 0.02, 1.0)
+        ac = rc * rc
+        ac2 = ac * ac
+        dc_den = ndh * ndh * (ac2 - 1.0) + 1.0
+        dc = ac2 / np.maximum(math.pi * dc_den * dc_den, 1e-6)
+        kc = ((rc + 1.0) ** 2) * 0.125
+        gc = (ndv / (ndv * (1.0 - kc) + kc)) * (ndl / np.maximum(ndl * (1.0 - kc) + kc, 1e-5))
+        fc = 0.04 + 0.96 * np.power(1.0 - vdh, 5.0)
+        coat_spec = clearcoat * np.minimum((dc * gc * fc) / np.maximum(4.0 * ndv * ndl, 1e-3), 8.0)
+        coat_atten = 1.0 - clearcoat * fc * 0.45
+
+    return ((diff + spec) * coat_atten + coat_spec + sheen_term) * ndl + (
+        kd * albedo_lin * subsurface * np.clip((ndl_raw + 0.55) / 1.55, 0.0, 1.0) * 0.25
+        if np.any(subsurface > 1e-4)
+        else 0.0
+    )
