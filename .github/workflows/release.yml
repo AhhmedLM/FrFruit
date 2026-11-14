@@ -1,0 +1,66 @@
+name: Release Windows App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies and PyInstaller
+        run: |
+          uv sync --python 3.12 --extra desktop
+          uv pip install pyinstaller
+
+      - name: Build FrFruitStudio.exe
+        run: uv run --python 3.12 pyinstaller --noconfirm --clean windows_app\frfruit_studio.spec
+
+      - name: Verify executable exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\FrFruitStudio.exe")) {
+            Write-Error "dist\FrFruitStudio.exe was not generated"
+            exit 1
+          }
+          Get-Item "dist\FrFruitStudio.exe" | Select-Object Name, Length
+
+      - name: Determine release tag
+        id: tag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            echo "name=${{ inputs.tag }}" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "name=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Create GitHub Release and upload FrFruitStudio.exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: "FrFruit Studio ${{ steps.tag.outputs.name }}"
+          generate_release_notes: true
+          files: |
+            dist/FrFruitStudio.exe
