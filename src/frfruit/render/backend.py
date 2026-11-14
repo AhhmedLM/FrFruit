@@ -8,6 +8,7 @@ from PIL import Image
 
 from frfruit.core.scene import SceneDocument, SceneObject
 from frfruit.geometry.spatial import EvaluatedObject
+from frfruit.render.pathtracer import PathTracerRenderer
 from frfruit.render.software import RenderConfig, SoftwareRenderer
 
 
@@ -23,6 +24,12 @@ class RendererBackend(Protocol):
 
 
 def get_renderer(backend: str = "auto") -> RendererBackend:
-    if backend in ("auto", "software", "cpu"):
+    key = backend.lower().strip()
+    if key in ("auto", "software", "cpu", "raster"):
         return SoftwareRenderer()
-    raise ValueError(f"Unknown renderer backend: {backend!r}. Available: 'auto', 'software'.")
+    if key in ("raytrace", "pathtracer", "rt", "cycles"):
+        return PathTracerRenderer()
+    raise ValueError(
+        f"Unknown renderer backend: {backend!r}. "
+        "Available: 'auto', 'software', 'raytrace', 'pathtracer'."
+    )

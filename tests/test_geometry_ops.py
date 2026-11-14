@@ -179,3 +179,231 @@ def test_modifier_stack_evaluation() -> None:
     )
     ev_petal = evaluate_object_mesh(doc, "petal")
     assert ev_petal.world_mesh.stats()["face_count"] == 12 * 6
+
+
+def test_full_edit_mode_modeling_suite_and_face_material_preservation() -> None:
+    from frfruit.geometry.edit_ops import inspect_mesh_elements, run_edit_operation
+
+    cube = make_cube(1.0, origin="bottom")
+    # Assign material slot to single face 0 and test preservation across operations
+    res_assign = run_edit_operation(
+        cube,
+        "assign_face_material",
+        SelectionQuery(mode="indices", indices=[0]),
+        material_id="mat_gold",
+    )
+    assert res_assign.face_material_ids == {0: "mat_gold"}
+
+    # Extrude individual faces + along normals + material override
+    res_ind = run_edit_operation(
+        res_assign.mesh,
+        "extrude_individual",
+        SelectionQuery(mode="top"),
+        face_material_ids=res_assign.face_material_ids,
+        distance=0.35,
+        scale=0.8,
+        material_id="mat_cap",
+    )
+    assert res_ind.mesh.stats()["is_watertight"] is True
+    assert res_ind.mesh.bounds().max_corner[2] == pytest.approx(1.35, abs=1e-6)
+    assert "mat_cap" in res_ind.face_material_ids.values()
+
+    res_along = run_edit_operation(
+        cube,
+        "extrude_along_normals",
+        SelectionQuery(mode="top"),
+        distance=0.25,
+    )
+    assert res_along.mesh.stats()["is_watertight"] is True
+    assert res_along.mesh.bounds().max_corner[2] == pytest.approx(1.25, abs=1e-6)
+
+    # Extrude manifold
+    res_mf = run_edit_operation(
+        cube, "extrude_manifold", SelectionQuery(mode="top"), distance=-0.25
+    )
+    assert res_mf.mesh.stats()["is_watertight"] is True
+
+    # Extrude vertices (struts)
+    res_ev = run_edit_operation(
+        cube,
+        "extrude_vertices",
+        SelectionQuery(mode="vertex_indices", vertex_indices=[0, 1]),
+        distance=0.3,
+        direction=(0.0, 0.0, 1.0),
+        width=0.05,
+    )
+    assert res_ev.mesh.stats()["face_count"] > cube.stats()["face_count"]
+
+    # Extrude edges on open plane
+    plane = make_plane(1.0, subdivisions=1)
+    res_ee = run_edit_operation(
+        plane,
+        "extrude_edges",
+        SelectionQuery(mode="edge_indices", edge_indices=[[0, 1]]),
+        distance=0.4,
+        direction=(0.0, 0.0, 1.0),
+    )
+    assert res_ee.mesh.stats()["face_count"] == plane.stats()["face_count"] + 2
+
+    # Loop cut + material preservation
+    res_lc = run_edit_operation(
+        res_assign.mesh,
+        "loop_cut",
+        SelectionQuery(mode="all"),
+        face_material_ids=res_assign.face_material_ids,
+        axis="z",
+        cuts=2,
+        slide=0.2,
+    )
+    assert res_lc.mesh.stats()["is_watertight"] is True
+    assert res_lc.mesh.stats()["face_count"] > cube.stats()["face_count"]
+    assert "mat_gold" in res_lc.face_material_ids.values()
+
+    # Partial face selection subdivide (conformal)
+    res_sub = run_edit_operation(
+        cube,
+        "subdivide",
+        SelectionQuery(mode="top"),
+        levels=1,
+    )
+    assert res_sub.mesh.stats()["is_watertight"] is True
+    assert res_sub.mesh.stats()["face_count"] > cube.stats()["face_count"]
+
+    # Bisect plane with fill_caps=True
+    res_bis = run_edit_operation(
+        cube,
+        "bisect_plane",
+        SelectionQuery(mode="all"),
+        plane_point=(0.0, 0.0, 0.5),
+        plane_normal=(0.0, 0.0, 1.0),
+        clear_outer=True,
+        fill_caps=True,
+    )
+    assert res_bis.mesh.stats()["is_watertight"] is True
+    assert res_bis.mesh.bounds().max_corner[2] == pytest.approx(0.5, abs=1e-5)
+
+    # Poke faces, inset individual, bevel vertices, solidify, wireframe
+    res_poke = run_edit_operation(cube, "poke_faces", SelectionQuery(mode="top"), offset=0.15)
+    assert res_poke.mesh.stats()["is_watertight"] is True
+    assert res_poke.mesh.bounds().max_corner[2] == pytest.approx(1.15, abs=1e-5)
+
+    res_in = run_edit_operation(
+        cube, "inset_faces", SelectionQuery(mode="top"), thickness=0.1, individual=True
+    )
+    assert res_in.mesh.stats()["is_watertight"] is True
+
+    res_bv = run_edit_operation(cube, "bevel_vertices", SelectionQuery(mode="top"), width=0.12)
+    assert res_bv.mesh.stats()["is_watertight"] is True
+    assert res_bv.mesh.stats()["face_count"] > cube.stats()["face_count"]
+
+    res_sol = run_edit_operation(plane, "solidify_faces", SelectionQuery(mode="all"), thickness=0.1)
+    assert res_sol.mesh.stats()["is_watertight"] is True
+
+    res_wire = run_edit_operation(cube, "wireframe_edges", SelectionQuery(mode="all"), width=0.04)
+    assert res_wire.mesh.stats()["face_count"] > cube.stats()["face_count"]
+
+    # Delete + fill_holes + bridge_edge_loops
+    res_del = run_edit_operation(
+        cube, "delete_elements", SelectionQuery(mode="top"), delete_mode="only_faces"
+    )
+    assert res_del.mesh.stats()["is_watertight"] is False
+    res_fill = run_edit_operation(res_del.mesh, "fill_holes", SelectionQuery(mode="all"))
+    assert res_fill.mesh.stats()["is_watertight"] is True
+
+    # Two open rings in one mesh -> bridge_edge_loops
+    ring_b = make_cube(1.0, origin="bottom")
+    open_bot = run_edit_operation(
+        ring_b, "delete_elements", SelectionQuery(mode="top"), delete_mode="only_faces"
+    ).mesh
+    open_top = run_edit_operation(
+        make_cube(1.0, origin="bottom"),
+        "delete_elements",
+        SelectionQuery(mode="bottom"),
+        delete_mode="only_faces",
+    ).mesh
+    import numpy as np
+
+    from frfruit.geometry.mesh import MeshData, concat_meshes
+
+    open_top = MeshData(
+        vertices=open_top.vertices + np.array([0.0, 0.0, 2.0]),
+        faces=open_top.faces,
+        uvs=open_top.uvs,
+    )
+
+    two_rings = concat_meshes([open_bot, open_top])
+    res_bridge = run_edit_operation(two_rings, "bridge_edge_loops", SelectionQuery(mode="all"))
+    assert res_bridge.mesh.stats()["face_count"] > two_rings.stats()["face_count"]
+
+    # Duplicate, split, separate_selection
+    res_dup = run_edit_operation(cube, "duplicate_faces", SelectionQuery(mode="top"), distance=0.25)
+    assert res_dup.mesh.stats()["face_count"] == cube.stats()["face_count"] + 2
+
+    res_sep = run_edit_operation(
+        res_assign.mesh,
+        "separate_selection",
+        SelectionQuery(mode="indices", indices=[0, 1]),
+        face_material_ids=res_assign.face_material_ids,
+    )
+    assert res_sep.separated_mesh is not None
+    assert res_sep.separated_mesh.stats()["face_count"] == 2
+    assert res_sep.mesh.stats()["face_count"] == cube.stats()["face_count"] - 2
+    assert res_sep.separated_face_material_ids == {0: "mat_gold"}
+
+    # Proportional transform, shrink_fatten, to_sphere, shear, symmetrize, normals, UV project
+    res_prop = run_edit_operation(
+        res_lc.mesh,
+        "transform_selection",
+        SelectionQuery(mode="top"),
+        translate=(0.0, 0.0, 0.4),
+        proportional_radius=0.8,
+        proportional_falloff="smooth",
+    )
+    assert res_prop.mesh.bounds().max_corner[2] == pytest.approx(1.4, abs=1e-5)
+
+    sf_size = (
+        run_edit_operation(cube, "shrink_fatten", SelectionQuery(mode="all"), distance=0.1)
+        .mesh.bounds()
+        .size[0]
+    )
+    assert sf_size > 1.15 and sf_size <= 1.2 + 1e-5
+
+    assert (
+        run_edit_operation(
+            res_lc.mesh, "to_sphere", SelectionQuery(mode="all"), factor=1.0
+        ).mesh.stats()["vertex_count"]
+        == res_lc.mesh.stats()["vertex_count"]
+    )
+    assert run_edit_operation(
+        cube, "shear", SelectionQuery(mode="all"), axis="x", shear_axis="z", factor=0.5
+    ).mesh.bounds().max_corner[0] == pytest.approx(0.75, abs=1e-5)
+    assert (
+        run_edit_operation(
+            cube, "symmetrize", SelectionQuery(mode="all"), symmetrize_direction="-x_to_+x"
+        ).mesh.stats()["is_watertight"]
+        is True
+    )
+
+    flipped = run_edit_operation(cube, "flip_normals", SelectionQuery(mode="all")).mesh
+    assert flipped.to_trimesh(process=False).volume < 0
+    recalc = run_edit_operation(flipped, "recompute_normals", SelectionQuery(mode="all")).mesh
+    assert recalc.to_trimesh(process=False).volume > 0
+
+    uv_res = run_edit_operation(
+        cube,
+        "project_uvs",
+        SelectionQuery(mode="all"),
+        projection="cylindrical",
+        uv_scale=(2.0, 2.0),
+    )
+    assert uv_res.mesh.uvs is not None and uv_res.mesh.uvs.shape == (len(cube.vertices), 2)
+
+    # Coplanar flood-fill + inspect_mesh_elements
+    summary = inspect_mesh_elements(
+        res_assign.mesh,
+        detail="selection",
+        query=SelectionQuery(mode="coplanar", seed_face=0),
+        face_material_ids=res_assign.face_material_ids,
+    )
+    assert len(summary["selection"]["selected_face_indices"]) == 2
+    assert np.isfinite(uv_res.mesh.uvs).all()

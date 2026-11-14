@@ -8,6 +8,7 @@ from typing import Literal
 import numpy as np
 from scipy.spatial import cKDTree
 
+from frfruit.animation.armature import deform_skinned_mesh
 from frfruit.core.math3d import (
     compose_matrix,
     compute_aabb,
@@ -70,7 +71,7 @@ def evaluate_object_mesh(
     obj_id: str,
     _cache: dict[str, EvaluatedObject] | None = None,
 ) -> EvaluatedObject:
-    """Evaluate a single mesh or procedural object including modifiers and world matrix."""
+    """Evaluate a mesh/procedural object with modifiers, vertex cache, skinning, and transform."""
     if _cache is not None and obj_id in _cache:
         return _cache[obj_id]
 
@@ -101,7 +102,44 @@ def evaluate_object_mesh(
         if obj.modifiers
         else base_mesh
     )
+
+    # Apply baked cloth/soft-body vertex cache frame if present
+    if obj.vertex_cache and not local_eval.is_empty:
+        cur_f = int(scene.timeline.current_frame)
+        cached_pts: np.ndarray | None = None
+        if cur_f in obj.vertex_cache and len(obj.vertex_cache[cur_f]) == len(local_eval.vertices):
+            cached_pts = np.asarray(obj.vertex_cache[cur_f], dtype=np.float64)
+        else:
+            valid_frames = sorted(
+                f for f, pts in obj.vertex_cache.items() if len(pts) == len(local_eval.vertices)
+            )
+            if valid_frames:
+                if cur_f <= valid_frames[0]:
+                    cached_pts = np.asarray(obj.vertex_cache[valid_frames[0]], dtype=np.float64)
+                elif cur_f >= valid_frames[-1]:
+                    cached_pts = np.asarray(obj.vertex_cache[valid_frames[-1]], dtype=np.float64)
+                else:
+                    # Linear interpolation between bracketing baked frames
+                    pos = int(np.searchsorted(valid_frames, cur_f))
+                    f0 = valid_frames[pos - 1]
+                    f1 = valid_frames[pos]
+                    t = (cur_f - f0) / max(1, f1 - f0)
+                    p0 = np.asarray(obj.vertex_cache[f0], dtype=np.float64)
+                    p1 = np.asarray(obj.vertex_cache[f1], dtype=np.float64)
+                    cached_pts = p0 * (1.0 - t) + p1 * t
+        if cached_pts is not None:
+            local_eval = local_eval.copy()
+            local_eval.vertices = cached_pts
+
     w_mat = compute_world_matrix(scene, obj_id)
+
+    # Apply armature Linear Blend Skinning if bound to an armature object
+    if obj.skin is not None and not local_eval.is_empty:
+        arm_obj = scene.resolve_object(obj.skin.armature_id)
+        if arm_obj is not None and arm_obj.kind == "armature" and arm_obj.armature is not None:
+            arm_mat = compute_world_matrix(scene, arm_obj.id)
+            local_eval = deform_skinned_mesh(local_eval, w_mat, obj.skin, arm_obj, arm_mat)
+
     w_verts = transform_points(w_mat, local_eval.vertices)
     # Flip face winding when negative-scale determinant reflects handedness
     faces = local_eval.faces.copy()

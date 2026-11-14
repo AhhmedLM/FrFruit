@@ -20,9 +20,13 @@ uv.lock
 htmlcov/
 
 # Generated exports / renders
+exports/
 *.png
 *.gif
 *.webp
+*.mp4
+*.webm
+*.fbx
 *.glb
 *.gltf
 *.obj

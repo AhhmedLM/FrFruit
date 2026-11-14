@@ -14,7 +14,8 @@ from frfruit.core.math3d import look_at_matrix, orthographic_matrix, transform_p
 from frfruit.core.scene import LightSpec, MaterialSpec, SceneDocument, SceneObject
 from frfruit.geometry.spatial import EvaluatedObject, compute_scene_bounds
 from frfruit.render.camera import build_camera_matrices
-from frfruit.render.materials import evaluate_surface_albedo
+from frfruit.render.materials import evaluate_material_maps
+from frfruit.render.postprocess import apply_post_processing
 
 RenderMode = Literal["pbr", "clay", "wireframe", "normals", "depth", "collision"]
 
@@ -27,6 +28,8 @@ class RenderConfig:
     show_grid: bool = True
     show_axes: bool = True
     enable_shadows: bool = True
+    samples: int = 2
+    max_bounces: int = 3
 
 
 def _rasterize_gbuffer(
@@ -67,21 +70,41 @@ def _rasterize_gbuffer(
     f1 = faces[:, 1]
     f2 = faces[:, 2]
 
-    # Keep triangles where all 3 vertices are in front of near plane (w_clip > 0)
-    in_front = (w_clip[f0] > 1e-4) & (w_clip[f1] > 1e-4) & (w_clip[f2] > 1e-4)
+    # Near plane condition (z_clip + w_clip >= 0 <=> distance >= clip_near in perspective & ortho)
+    g_near = clip[:, 2] + w_clip
+    g0, g1, g2 = g_near[f0], g_near[f1], g_near[f2]
+    all_in_front = (
+        (g0 >= 0.0)
+        & (g1 >= 0.0)
+        & (g2 >= 0.0)
+        & (w_clip[f0] > 1e-4)
+        & (w_clip[f1] > 1e-4)
+        & (w_clip[f2] > 1e-4)
+    )
+    straddle_mask = ((g0 >= 0.0) | (g1 >= 0.0) | (g2 >= 0.0)) & (~all_in_front)
+
+    # Screen coordinates for fully-in-front vertices
+    w_safe = np.where(np.abs(w_clip) < 1e-6, 1e-6, w_clip)
+    ndc_x = clip[:, 0] / w_safe
+    ndc_y = clip[:, 1] / w_safe
+    ndc_z = clip[:, 2] / w_safe
+
+    sx = (ndc_x * 0.5 + 0.5) * width
+    sy = (0.5 - ndc_y * 0.5) * height
 
     x0_all, y0_all, z0_all = sx[f0], sy[f0], ndc_z[f0]
     x1_all, y1_all, z1_all = sx[f1], sy[f1], ndc_z[f1]
     x2_all, y2_all, z2_all = sx[f2], sy[f2], ndc_z[f2]
+    w0_all, w1_all, w2_all = w_safe[f0], w_safe[f1], w_safe[f2]
 
     # Signed double area in screen space (remember Y is flipped downward!)
     # CCW in NDC (+Y up) becomes negative signed area in +Y-down screen space.
     area2_all = (x1_all - x0_all) * (y2_all - y0_all) - (y1_all - y0_all) * (x2_all - x0_all)
 
     if cull_backfaces:
-        valid_mask = in_front & (area2_all < -1e-3)
+        valid_mask = all_in_front & (area2_all < -1e-3)
     else:
-        valid_mask = in_front & (np.abs(area2_all) > 1e-3)
+        valid_mask = all_in_front & (np.abs(area2_all) > 1e-3)
 
     # Bounding-box screen frustum culling
     min_x = np.floor(np.minimum(x0_all, np.minimum(x1_all, x2_all))).astype(np.int32)
@@ -95,51 +118,85 @@ def _rasterize_gbuffer(
     )
 
     cand_idx = np.nonzero(valid_mask)[0]
-    if len(cand_idx) == 0:
+    straddle_idx = np.nonzero(straddle_mask)[0]
+    if len(cand_idx) == 0 and len(straddle_idx) == 0:
         return z_buf, tri_id_buf, u_buf, v_buf, edge_px_buf
 
     px_grid = np.arange(width, dtype=np.float32)[None, :] + 0.5
     py_grid = np.arange(height, dtype=np.float32)[:, None] + 0.5
 
-    for ti in cand_idx:
-        ix0 = max(0, int(min_x[ti]))
-        ix1 = min(width, int(max_x[ti]))
-        iy0 = max(0, int(min_y[ti]))
-        iy1 = min(height, int(max_y[ti]))
+    def _rasterize_subtri(
+        orig_ti: int,
+        ax: float,
+        ay: float,
+        az: float,
+        aw: float,
+        bx: float,
+        by: float,
+        bz: float,
+        bw: float,
+        cx: float,
+        cy: float,
+        cz: float,
+        cw: float,
+        ba: np.ndarray,
+        bb: np.ndarray,
+        bc: np.ndarray,
+    ) -> None:
+        a2 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if cull_backfaces:
+            if a2 >= -1e-3:
+                return
+        elif abs(a2) <= 1e-3:
+            return
+        if max(ax, bx, cx) <= 0.0 or min(ax, bx, cx) >= width:
+            return
+        if max(ay, by, cy) <= 0.0 or min(ay, by, cy) >= height:
+            return
+        ix0 = max(0, int(math.floor(min(ax, bx, cx))))
+        ix1 = min(width, int(math.ceil(max(ax, bx, cx))))
+        iy0 = max(0, int(math.floor(min(ay, by, cy))))
+        iy1 = min(height, int(math.ceil(max(ay, by, cy))))
         if ix1 <= ix0 or iy1 <= iy0:
-            continue
+            return
 
-        ax, ay, az = float(x0_all[ti]), float(y0_all[ti]), float(z0_all[ti])
-        bx, by, bz = float(x1_all[ti]), float(y1_all[ti]), float(z1_all[ti])
-        cx, cy, cz = float(x2_all[ti]), float(y2_all[ti]), float(z2_all[ti])
-        inv_a2 = 1.0 / float(area2_all[ti])
-
+        inv_a2 = 1.0 / a2
         px = px_grid[:, ix0:ix1]
         py = py_grid[iy0:iy1, :]
 
-        # Barycentric weights: e0 corresponds to vertex A (opposite BC), e1 to B (CA), e2 to C (AB)
         e0 = ((cx - bx) * (py - by) - (cy - by) * (px - bx)) * inv_a2
         e1 = ((ax - cx) * (py - cy) - (ay - cy) * (px - cx)) * inv_a2
         e2 = 1.0 - e0 - e1
 
         inside = (e0 >= -1e-4) & (e1 >= -1e-4) & (e2 >= -1e-4)
         if not np.any(inside):
-            continue
+            return
 
         z_interp = e0 * az + e1 * bz + e2 * cz
         inside &= (z_interp >= -1.0) & (z_interp <= 1.0)
         z_slice = z_buf[iy0:iy1, ix0:ix1]
         closer = inside & (z_interp < z_slice)
         if not np.any(closer):
-            continue
+            return
 
         z_slice[closer] = z_interp[closer]
-        tri_id_buf[iy0:iy1, ix0:ix1][closer] = int(ti)
-        u_buf[iy0:iy1, ix0:ix1][closer] = e1[closer]
-        v_buf[iy0:iy1, ix0:ix1][closer] = e2[closer]
+        tri_id_buf[iy0:iy1, ix0:ix1][closer] = orig_ti
 
-        # Exact screen-space perpendicular distance to nearest triangle edge (in pixels)
-        abs_a2 = abs(float(area2_all[ti]))
+        # Perspective-correct interpolation via 1/w back into original triangle barycentrics
+        inv_w0 = 1.0 / (aw if abs(aw) > 1e-6 else 1e-6)
+        inv_w1 = 1.0 / (bw if abs(bw) > 1e-6 else 1e-6)
+        inv_w2 = 1.0 / (cw if abs(cw) > 1e-6 else 1e-6)
+        pw0 = e0[closer] * inv_w0
+        pw1 = e1[closer] * inv_w1
+        pw2 = e2[closer] * inv_w2
+        inv_sum = 1.0 / np.where(np.abs(pw0 + pw1 + pw2) < 1e-12, 1.0, pw0 + pw1 + pw2)
+        s0 = pw0 * inv_sum
+        s1 = pw1 * inv_sum
+        s2 = pw2 * inv_sum
+        u_buf[iy0:iy1, ix0:ix1][closer] = s0 * ba[1] + s1 * bb[1] + s2 * bc[1]
+        v_buf[iy0:iy1, ix0:ix1][closer] = s0 * ba[2] + s1 * bb[2] + s2 * bc[2]
+
+        abs_a2 = abs(a2)
         l0 = math.hypot(cx - bx, cy - by) + 1e-6
         l1 = math.hypot(ax - cx, ay - cy) + 1e-6
         l2 = math.hypot(bx - ax, by - ay) + 1e-6
@@ -148,6 +205,91 @@ def _rasterize_gbuffer(
             np.minimum(e1 * abs_a2 / l1, e2 * abs_a2 / l2),
         )
         edge_px_buf[iy0:iy1, ix0:ix1][closer] = d_min[closer]
+
+    b0_eye = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    b1_eye = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    b2_eye = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    for ti in cand_idx:
+        _rasterize_subtri(
+            int(ti),
+            float(x0_all[ti]),
+            float(y0_all[ti]),
+            float(z0_all[ti]),
+            float(w0_all[ti]),
+            float(x1_all[ti]),
+            float(y1_all[ti]),
+            float(z1_all[ti]),
+            float(w1_all[ti]),
+            float(x2_all[ti]),
+            float(y2_all[ti]),
+            float(z2_all[ti]),
+            float(w2_all[ti]),
+            b0_eye,
+            b1_eye,
+            b2_eye,
+        )
+
+    # Clip near-plane straddling triangles cleanly against g = z_clip + w_clip >= 0
+    for ti in straddle_idx:
+        poly_c = [clip[f0[ti]], clip[f1[ti]], clip[f2[ti]]]
+        poly_b = [b0_eye, b1_eye, b2_eye]
+        poly_g = [float(g0[ti]), float(g1[ti]), float(g2[ti])]
+        out_c: list[np.ndarray] = []
+        out_b: list[np.ndarray] = []
+        n_v = len(poly_c)
+        for k in range(n_v):
+            ca, cb = poly_c[k], poly_c[(k + 1) % n_v]
+            ba, bb = poly_b[k], poly_b[(k + 1) % n_v]
+            ga, gb = poly_g[k], poly_g[(k + 1) % n_v]
+            if ga >= 0.0:
+                out_c.append(ca)
+                out_b.append(ba)
+                if gb < 0.0 and (ga - gb) > 1e-12:
+                    t_e = ga / (ga - gb)
+                    out_c.append(ca + t_e * (cb - ca))
+                    out_b.append(ba + t_e * (bb - ba))
+            elif gb >= 0.0 and (gb - ga) > 1e-12:
+                t_e = ga / (ga - gb)
+                out_c.append(ca + t_e * (cb - ca))
+                out_b.append(ba + t_e * (bb - ba))
+        if len(out_c) < 3:
+            continue
+        proj_pts: list[tuple[float, float, float, float, np.ndarray]] = []
+        ok_poly = True
+        for cv, bv in zip(out_c, out_b, strict=True):
+            cw = float(cv[3])
+            if cw <= 1e-5:
+                ok_poly = False
+                break
+            nx = float(cv[0]) / cw
+            ny = float(cv[1]) / cw
+            nz = float(cv[2]) / cw
+            proj_pts.append(((nx * 0.5 + 0.5) * width, (0.5 - ny * 0.5) * height, nz, cw, bv))
+        if not ok_poly:
+            continue
+        pa = proj_pts[0]
+        for k in range(1, len(proj_pts) - 1):
+            pb = proj_pts[k]
+            pc = proj_pts[k + 1]
+            _rasterize_subtri(
+                int(ti),
+                pa[0],
+                pa[1],
+                pa[2],
+                pa[3],
+                pb[0],
+                pb[1],
+                pb[2],
+                pb[3],
+                pc[0],
+                pc[1],
+                pc[2],
+                pc[3],
+                pa[4],
+                pb[4],
+                pc[4],
+            )
 
     return z_buf, tri_id_buf, u_buf, v_buf, edge_px_buf
 
@@ -210,7 +352,7 @@ class SoftwareRenderer:
         view, proj, eye_world = build_camera_matrices(cam_obj, aspect)
         vp = proj @ view
 
-        # Background sky gradient
+        # Background sky gradient (stored linear for HDR modes, display for diagnostic modes)
         y_frac = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
         zenith = np.asarray(scene.world.zenith_color, dtype=np.float32)[None, None, :]
         horizon = np.asarray(scene.world.horizon_color, dtype=np.float32)[None, None, :]
@@ -222,9 +364,14 @@ class SoftwareRenderer:
             bg = zenith * (1.0 - y_frac) + horizon * y_frac
             bg = np.broadcast_to(bg, (h, w, 3)).copy()
 
+        hdr_mode = cfg.mode in ("pbr", "clay", "wireframe")
+        if hdr_mode:
+            bg = np.power(np.clip(bg, 0.0, 1.0), 2.2)
+
         # Gather flattened world triangles across all evaluated objects
         all_verts: list[np.ndarray] = []
         all_vnormals: list[np.ndarray] = []
+        all_uvs: list[np.ndarray] = []
         all_faces: list[np.ndarray] = []
         tri_mat_list: list[MaterialSpec] = []
         tri_mat_idx: list[np.ndarray] = []
@@ -251,6 +398,10 @@ class SoftwareRenderer:
                 continue
             all_verts.append(mesh.vertices)
             all_vnormals.append(mesh.vertex_normals())
+            if mesh.uvs is not None and len(mesh.uvs) == len(mesh.vertices):
+                all_uvs.append(mesh.uvs)
+            else:
+                all_uvs.append(np.full((len(mesh.vertices), 2), np.nan, dtype=np.float64))
             all_faces.append(mesh.faces + v_offset)
             v_offset += len(mesh.vertices)
 
@@ -266,12 +417,14 @@ class SoftwareRenderer:
         if all_verts:
             verts_w = np.vstack(all_verts)
             vnormals_w = np.vstack(all_vnormals)
+            uvs_w = np.vstack(all_uvs)
             faces_w = np.vstack(all_faces)
             mat_idx_per_tri = np.concatenate(tri_mat_idx)
             coll_per_tri = np.concatenate(tri_is_colliding)
         else:
             verts_w = np.zeros((0, 3), dtype=np.float64)
             vnormals_w = np.zeros((0, 3), dtype=np.float64)
+            uvs_w = np.zeros((0, 2), dtype=np.float64)
             faces_w = np.zeros((0, 3), dtype=np.int64)
             mat_idx_per_tri = np.zeros((0,), dtype=np.int32)
             coll_per_tri = np.zeros((0,), dtype=bool)
@@ -286,7 +439,9 @@ class SoftwareRenderer:
             cull_backfaces=False,
         )
 
-        # Shade hit pixels first, then overlay depth-tested ground grid on open pixels
+        depth_cam = np.full((h, w), np.inf, dtype=np.float32)
+
+        # Shade hit pixels first, then run HDR post-processing before crisp CAD grid overlay
         hit_mask = tri_id_buf >= 0
         if np.any(hit_mask):
             tids = tri_id_buf[hit_mask]
@@ -299,9 +454,25 @@ class SoftwareRenderer:
             tri_v2 = verts_w[faces_w[tids, 2]]
             pos_w = w_b * tri_v0 + u * tri_v1 + v * tri_v2
 
+            cam_dist = np.linalg.norm(pos_w - eye_world[None, :], axis=1).astype(np.float32)
+            depth_cam[hit_mask] = cam_dist
+
+            fn_tri = np.cross(tri_v1 - tri_v0, tri_v2 - tri_v0)
+            fn_len = np.linalg.norm(fn_tri, axis=1, keepdims=True)
+            fn_tri = fn_tri / np.where(fn_len < 1e-12, 1.0, fn_len)
+
             tri_n0 = vnormals_w[faces_w[tids, 0]]
             tri_n1 = vnormals_w[faces_w[tids, 1]]
             tri_n2 = vnormals_w[faces_w[tids, 2]]
+            tri_n0 = np.where(
+                np.sum(tri_n0 * fn_tri, axis=1, keepdims=True) < 0.743, fn_tri, tri_n0
+            )
+            tri_n1 = np.where(
+                np.sum(tri_n1 * fn_tri, axis=1, keepdims=True) < 0.743, fn_tri, tri_n1
+            )
+            tri_n2 = np.where(
+                np.sum(tri_n2 * fn_tri, axis=1, keepdims=True) < 0.743, fn_tri, tri_n2
+            )
             nrm = w_b * tri_n0 + u * tri_n1 + v * tri_n2
             n_len = np.linalg.norm(nrm, axis=1, keepdims=True)
             nrm = nrm / np.where(n_len < 1e-12, 1.0, n_len)
@@ -312,6 +483,11 @@ class SoftwareRenderer:
             view_dir = view_dir / np.where(vd_len < 1e-12, 1.0, vd_len)
             flip_sign = np.where(np.sum(nrm * view_dir, axis=1, keepdims=True) < 0.0, -1.0, 1.0)
             nrm_oriented = nrm * flip_sign
+
+            tri_uv0 = uvs_w[faces_w[tids, 0]]
+            tri_uv1 = uvs_w[faces_w[tids, 1]]
+            tri_uv2 = uvs_w[faces_w[tids, 2]]
+            uv_hit = w_b * tri_uv0 + u * tri_uv1 + v * tri_uv2
 
             if cfg.mode == "normals":
                 shaded = np.clip(nrm * 0.5 + 0.5, 0.0, 1.0)
@@ -338,7 +514,9 @@ class SoftwareRenderer:
                 albedo = np.zeros((n_px, 3), dtype=np.float64)
                 metallic = np.zeros((n_px, 1), dtype=np.float64)
                 roughness = np.full((n_px, 1), 0.5, dtype=np.float64)
+                ao_map = np.ones((n_px, 1), dtype=np.float64)
                 emission = np.zeros((n_px, 3), dtype=np.float64)
+                shaded_nrm = nrm_oriented.copy()
 
                 if cfg.mode == "clay":
                     albedo[:] = np.array([0.78, 0.76, 0.73])
@@ -349,9 +527,17 @@ class SoftwareRenderer:
                         mask_m = hit_mat_ids == mi
                         if not np.any(mask_m):
                             continue
-                        albedo[mask_m] = evaluate_surface_albedo(mspec, pos_w[mask_m])
-                        metallic[mask_m] = mspec.metallic
-                        roughness[mask_m] = mspec.roughness
+                        alb_m, nrm_m, rgh_m, mtl_m, ao_m = evaluate_material_maps(
+                            mspec,
+                            pos_w[mask_m],
+                            shaded_nrm[mask_m],
+                            uvs=uv_hit[mask_m],
+                        )
+                        albedo[mask_m] = alb_m
+                        shaded_nrm[mask_m] = nrm_m
+                        roughness[mask_m] = rgh_m
+                        metallic[mask_m] = mtl_m
+                        ao_map[mask_m] = ao_m
                         if mspec.emission_strength > 0:
                             emission[mask_m] = (
                                 np.asarray(mspec.emission_color[:3])[None, :]
@@ -418,18 +604,18 @@ class SoftwareRenderer:
                             sun_shadow_factor[idx_sm, 0] = 1.0 - 0.72 * (occ * 0.25)
 
                 # Hemisphere ambient lighting + analytic IBL reflection for metallic surfaces
-                hemi_t = 0.5 + 0.5 * nrm_oriented[:, 2:3]
+                hemi_t = 0.5 + 0.5 * shaded_nrm[:, 2:3]
                 sky_c = np.asarray(scene.world.zenith_color, dtype=np.float64)[None, :] * 1.6 + 0.16
                 gnd_c = (
                     np.asarray(scene.world.horizon_color, dtype=np.float64)[None, :] * 0.75 + 0.06
                 )
                 amb_col = gnd_c * (1.0 - hemi_t) + sky_c * hemi_t
 
-                ndv = np.clip(np.sum(nrm_oriented * view_dir, axis=1, keepdims=True), 0.0, 1.0)
+                ndv = np.clip(np.sum(shaded_nrm * view_dir, axis=1, keepdims=True), 0.0, 1.0)
                 f0 = 0.04 * (1.0 - metallic) + albedo_lin * metallic
                 fresnel = f0 + (1.0 - f0) * ((1.0 - ndv) ** 5)
 
-                refl = 2.0 * np.sum(nrm_oriented * view_dir, axis=1, keepdims=True) * nrm_oriented
+                refl = 2.0 * np.sum(shaded_nrm * view_dir, axis=1, keepdims=True) * shaded_nrm
                 refl = refl - view_dir
                 refl_t = np.clip(0.5 + 0.5 * refl[:, 2:3], 0.0, 1.0)
                 env_refl = (
@@ -441,10 +627,11 @@ class SoftwareRenderer:
                     * env_refl
                     * (0.15 + 0.75 * metallic)
                     * (0.5 + scene.world.ambient_strength)
+                    * ao_map
                 )
 
                 total_light = (
-                    albedo_lin * amb_col * scene.world.ambient_strength * (1.0 - metallic)
+                    albedo_lin * amb_col * scene.world.ambient_strength * (1.0 - metallic) * ao_map
                     + ibl_spec
                 )
 
@@ -478,11 +665,11 @@ class SoftwareRenderer:
                             )
                             atten = atten * spot_mask
 
-                    ndl = np.clip(np.sum(nrm_oriented * l_vec, axis=1, keepdims=True), 0.0, 1.0)
+                    ndl = np.clip(np.sum(shaded_nrm * l_vec, axis=1, keepdims=True), 0.0, 1.0)
                     half_v = l_vec + view_dir
                     hv_len = np.linalg.norm(half_v, axis=1, keepdims=True)
                     half_v = half_v / np.where(hv_len < 1e-12, 1.0, hv_len)
-                    ndh = np.clip(np.sum(nrm_oriented * half_v, axis=1, keepdims=True), 0.0, 1.0)
+                    ndh = np.clip(np.sum(shaded_nrm * half_v, axis=1, keepdims=True), 0.0, 1.0)
                     spec_pow = np.power(ndh, shininess) * (0.25 + 0.75 * (1.0 - roughness))
                     diff = albedo_lin * (1.0 - metallic) * ndl
                     spec = fresnel * spec_pow * ndl * 1.4
@@ -497,14 +684,12 @@ class SoftwareRenderer:
                         shaded * 0.65 * (1.0 - wire_mix) + np.array([[0.12, 0.92, 0.98]]) * wire_mix
                     )
 
-            # Reinhard tone mapping & sRGB gamma curve
-            if cfg.mode in ("pbr", "clay", "wireframe"):
-                shaded = shaded / (1.0 + shaded * 0.45)
-                shaded = np.power(np.clip(shaded, 0.0, 1.0), 1.0 / 2.2)
-
             bg[hit_mask] = shaded.astype(np.float32)
 
-        # Depth-tested ground grid on XY plane (Z=0)
+        if hdr_mode:
+            bg = apply_post_processing(bg, depth_buf=depth_cam, config=scene.post_process)
+
+        # Depth-tested ground grid on XY plane (Z=0) in display space so lines stay crisp
         if cfg.show_grid and cfg.mode not in ("depth",):
             grid_extent = 5
             for i in range(-grid_extent, grid_extent + 1):

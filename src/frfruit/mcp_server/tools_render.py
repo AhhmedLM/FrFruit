@@ -13,18 +13,92 @@ from mcp.types import ImageContent, TextContent, ToolAnnotations
 from pydantic import Field
 
 from frfruit.core.scene import CameraSpec, LightSpec, MaterialSpec, SceneObject
-from frfruit.core.types import ColorRGB, Transform, Vec3, parse_color_rgba
+from frfruit.core.types import ColorRGB, SelectionQuery, Transform, Vec3, parse_color_rgba
+from frfruit.geometry.edit_ops import resolve_face_selection
+from frfruit.geometry.mesh import GeometryError, MeshData
 from frfruit.geometry.spatial import (
     compute_scene_bounds,
     evaluate_object_mesh,
     evaluate_scene_meshes,
 )
 from frfruit.io.exporters import export_scene_file
+from frfruit.io.fbx_exporter import TargetEngine
 from frfruit.mcp_server.context import FrFruitSession
 from frfruit.render.camera import ViewDirection, auto_frame_camera_object
 from frfruit.render.materials import PRESET_MATERIALS, list_material_presets
 from frfruit.render.software import RenderMode
 from frfruit.render.viewport import render_multiview_sheet, render_single_view
+
+
+def _apply_face_material_selection(
+    sess_scene: Any,
+    obj: SceneObject,
+    mat_id: str | None,
+    *,
+    face_index: int | None,
+    face_indices: list[int] | None,
+    selection_mode: str | None,
+    direction: Vec3 | None,
+    angle_threshold_deg: float,
+    bbox_min: Vec3 | None,
+    bbox_max: Vec3 | None,
+    seed_face: int | None,
+    invert: bool,
+    clear: bool = False,
+) -> list[int]:
+    if obj.mesh is not None:
+        base_mesh = MeshData.from_payload(obj.mesh)
+    else:
+        ev = evaluate_object_mesh(sess_scene, obj.id)
+        base_mesh = ev.local_mesh
+    if base_mesh.is_empty:
+        raise ToolError(f"Object {obj.name!r} has an empty mesh.")
+
+    eff_indices: list[int] | None = None
+    if face_indices is not None:
+        eff_indices = [int(i) for i in face_indices]
+    elif face_index is not None:
+        eff_indices = [int(face_index)]
+
+    mode = selection_mode or ("indices" if eff_indices is not None else "all")
+    if clear and selection_mode is None and eff_indices is None and not invert:
+        cleared = sorted(obj.face_material_ids.keys())
+        obj.face_material_ids.clear()
+        return cleared
+
+    try:
+        query = SelectionQuery(
+            mode=mode,  # type: ignore[arg-type]
+            direction=direction,
+            angle_threshold_deg=angle_threshold_deg,
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            indices=eff_indices,
+            seed_face=seed_face,
+            invert=invert,
+        )
+        mask = resolve_face_selection(
+            base_mesh,
+            query,
+            face_material_ids=obj.face_material_ids,
+            base_material_id=obj.material_id,
+        )
+    except (ValueError, GeometryError) as exc:
+        raise ToolError(str(exc)) from exc
+
+    import numpy as np
+
+    matched = [int(i) for i in np.nonzero(mask)[0].tolist()]
+    if not matched:
+        raise ToolError(f"Face selection ({mode}) matched 0 faces on {obj.name!r}.")
+    if clear:
+        for fi in matched:
+            obj.face_material_ids.pop(fi, None)
+    else:
+        assert mat_id is not None
+        for fi in matched:
+            obj.face_material_ids[fi] = mat_id
+    return matched
 
 
 def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSession]) -> None:
@@ -34,7 +108,14 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
     )
     def material_create_or_assign(
         action: Annotated[
-            Literal["create", "assign", "create_and_assign", "list_presets"],
+            Literal[
+                "create",
+                "assign",
+                "create_and_assign",
+                "assign_faces",
+                "clear_faces",
+                "list_presets",
+            ],
             Field(description="Material operation."),
         ] = "create_and_assign",
         material_id: Annotated[
@@ -72,23 +153,118 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
             Field(description="Procedural surface pattern."),
         ] = None,
         pattern_scale: Annotated[float | None, Field(gt=0.0)] = None,
+        face_index: Annotated[
+            int | None,
+            Field(ge=0, description="Single face index to assign material to (Edit Mode slot)."),
+        ] = None,
+        face_indices: Annotated[
+            list[int] | None,
+            Field(description="List of face indices to assign material to."),
+        ] = None,
+        selection_mode: Annotated[
+            Literal[
+                "all",
+                "top",
+                "bottom",
+                "front",
+                "back",
+                "left",
+                "right",
+                "normal_dir",
+                "bbox",
+                "indices",
+                "coplanar",
+                "boundary",
+                "material",
+            ]
+            | None,
+            Field(description="Optional face selection mode for per-face material assignment."),
+        ] = None,
+        direction: Annotated[
+            Vec3 | None, Field(description="Direction vector when selection_mode='normal_dir'.")
+        ] = None,
+        angle_threshold_deg: Annotated[float, Field(ge=0.5, le=180.0)] = 45.0,
+        bbox_min: Annotated[
+            Vec3 | None, Field(description="Bounding box min when selection_mode='bbox'.")
+        ] = None,
+        bbox_max: Annotated[
+            Vec3 | None, Field(description="Bounding box max when selection_mode='bbox'.")
+        ] = None,
+        seed_face: Annotated[
+            int | None, Field(ge=0, description="Seed face index for coplanar flood-fill.")
+        ] = None,
+        invert: Annotated[bool, Field(description="Invert resolved face selection.")] = False,
     ) -> dict[str, Any]:
-        """List presets, create PBR/procedural materials, or assign them to objects."""
+        """List presets, create PBR/procedural materials, or assign to objects or single faces."""
         sess = get_session()
         with sess.lock:
             if action == "list_presets":
                 return {"presets": list_material_presets()}
 
-            if action == "assign":
+            has_face_target = (
+                face_index is not None or face_indices is not None or selection_mode is not None
+            )
+
+            if action == "clear_faces":
+                if not object_id:
+                    raise ToolError("object_id is required for action='clear_faces'.")
+                obj = sess.require_mesh_like(object_id)
+                sess.push_history(f"clear_face_materials:{obj.name}")
+                cleared = _apply_face_material_selection(
+                    sess.scene,
+                    obj,
+                    None,
+                    face_index=face_index,
+                    face_indices=face_indices,
+                    selection_mode=selection_mode,
+                    direction=direction,
+                    angle_threshold_deg=angle_threshold_deg,
+                    bbox_min=bbox_min,
+                    bbox_max=bbox_max,
+                    seed_face=seed_face,
+                    invert=invert,
+                    clear=True,
+                )
+                return {
+                    "status": "ok",
+                    "object_id": obj.id,
+                    "cleared_faces": cleared,
+                    "remaining_face_materials": len(obj.face_material_ids),
+                }
+
+            if action in ("assign", "assign_faces"):
                 if not material_id or not object_id:
                     raise ToolError(
-                        "Both material_id and object_id are required for action='assign'."
+                        f"Both material_id and object_id are required for action={action!r}."
                     )
                 mat = sess.scene.resolve_material(material_id)
                 if mat is None:
                     avail = list(sess.scene.materials.keys())
                     raise ToolError(f"Material {material_id!r} not found. Available: {avail}")
                 obj = sess.require_mesh_like(object_id)
+                if action == "assign_faces" or has_face_target:
+                    sess.push_history(f"assign_face_material:{obj.name}")
+                    assigned = _apply_face_material_selection(
+                        sess.scene,
+                        obj,
+                        mat.id,
+                        face_index=face_index,
+                        face_indices=face_indices,
+                        selection_mode=selection_mode,
+                        direction=direction,
+                        angle_threshold_deg=angle_threshold_deg,
+                        bbox_min=bbox_min,
+                        bbox_max=bbox_max,
+                        seed_face=seed_face,
+                        invert=invert,
+                    )
+                    return {
+                        "status": "ok",
+                        "object_id": obj.id,
+                        "material_id": mat.id,
+                        "assigned_faces": assigned,
+                        "assigned_face_count": len(assigned),
+                    }
                 sess.push_history(f"assign_material:{obj.name}")
                 obj.material_id = mat.id
                 return {"status": "ok", "object_id": obj.id, "material_id": mat.id}
@@ -132,18 +308,39 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
             sess.scene.materials[mid] = mat
 
             assigned_to: str | None = None
+            assigned_faces: list[int] | None = None
             if action == "create_and_assign":
                 if not object_id:
                     raise ToolError("object_id is required when action='create_and_assign'.")
                 obj = sess.require_mesh_like(object_id)
-                obj.material_id = mid
+                if has_face_target:
+                    assigned_faces = _apply_face_material_selection(
+                        sess.scene,
+                        obj,
+                        mid,
+                        face_index=face_index,
+                        face_indices=face_indices,
+                        selection_mode=selection_mode,
+                        direction=direction,
+                        angle_threshold_deg=angle_threshold_deg,
+                        bbox_min=bbox_min,
+                        bbox_max=bbox_max,
+                        seed_face=seed_face,
+                        invert=invert,
+                    )
+                else:
+                    obj.material_id = mid
                 assigned_to = obj.id
 
-            return {
+            out: dict[str, Any] = {
                 "status": "ok",
                 "material": mat.model_dump(),
                 "assigned_to": assigned_to,
             }
+            if assigned_faces is not None:
+                out["assigned_faces"] = assigned_faces
+                out["assigned_face_count"] = len(assigned_faces)
+            return out
 
     @mcp.tool(
         title="Manage Scene Lights & World",
@@ -440,6 +637,11 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
             RenderMode,
             Field(description="Shader mode: pbr, clay, wireframe, normals, depth, or collision."),
         ] = "pbr",
+        engine: Annotated[
+            Literal["software", "raytrace"] | None,
+            Field(description="Optional render engine override ('software' or 'raytrace')."),
+        ] = None,
+        samples: Annotated[int, Field(ge=1, le=16, description="Raytracer samples per pixel.")] = 2,
         width: Annotated[int, Field(ge=128, le=1920)] = 640,
         height: Annotated[int, Field(ge=128, le=1080)] = 480,
         camera_id: Annotated[str | None, Field(description="Optional camera ID or name.")] = None,
@@ -475,6 +677,8 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                 show_axes=show_axes,
                 show_bounds=show_bounds,
                 show_labels=show_labels,
+                engine=engine,
+                samples=samples,
             )
             if out_path is not None:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -495,6 +699,11 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
             RenderMode,
             Field(description="Shader mode: pbr, clay, wireframe, normals, depth, or collision."),
         ] = "pbr",
+        engine: Annotated[
+            Literal["software", "raytrace"] | None,
+            Field(description="Optional render engine override ('software' or 'raytrace')."),
+        ] = None,
+        samples: Annotated[int, Field(ge=1, le=16, description="Raytracer samples per pixel.")] = 2,
         tile_width: Annotated[int, Field(ge=160, le=960)] = 420,
         tile_height: Annotated[int, Field(ge=120, le=720)] = 320,
         views: Annotated[
@@ -526,6 +735,8 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                 show_axes=show_axes,
                 show_bounds=show_bounds,
                 show_labels=show_labels,
+                engine=engine,
+                samples=samples,
             )
             if out_path is not None:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,23 +754,40 @@ def register_render_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
     )
     def export_scene(
         path: Annotated[
-            str, Field(description="Output path relative to workspace (e.g. 'out/model.glb').")
-        ],
-        format: Annotated[
-            Literal["glb", "gltf", "obj", "stl", "ply", "py"] | None,
+            str,
             Field(
                 description=(
-                    "Optional explicit format override (glb, gltf, obj, stl, ply, or Blender py)."
+                    "Output path relative to workspace (e.g. 'out/model.fbx', 'out/model.glb')."
+                )
+            ),
+        ],
+        format: Annotated[
+            Literal["fbx", "fbx_ascii", "glb", "gltf", "obj", "stl", "ply", "py"] | None,
+            Field(
+                description=(
+                    "Optional explicit format override "
+                    "(fbx, fbx_ascii, glb, gltf, obj, stl, ply, or py)."
                 )
             ),
         ] = None,
+        target_engine: Annotated[
+            TargetEngine,
+            Field(
+                description="Game-engine FBX axis/rig convention: generic, unreal, unity, or godot."
+            ),
+        ] = "generic",
     ) -> dict[str, Any]:
-        """Export scene to GLB/GLTF (with PBR & animations), OBJ, STL, PLY, or Blender .py."""
+        """Export scene to FBX (bones/anim/morphs), GLB/GLTF, OBJ, STL, PLY, or Blender .py."""
         sess = get_session()
         with sess.lock:
             out_p = sess.resolve_path(path)
             try:
-                res = export_scene_file(sess.scene, out_p, fmt=format)
+                res = export_scene_file(
+                    sess.scene,
+                    out_p,
+                    fmt=format,
+                    target_engine=target_engine,
+                )
             except ValueError as exc:
                 raise ToolError(str(exc)) from exc
             return {"status": "ok", **res}

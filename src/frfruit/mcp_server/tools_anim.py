@@ -180,6 +180,11 @@ def register_anim_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSession
         width: Annotated[int, Field(ge=128, le=800)] = 360,
         height: Annotated[int, Field(ge=128, le=600)] = 270,
         mode: Annotated[RenderMode, Field(description="Visual render mode.")] = "pbr",
+        engine: Annotated[
+            Literal["software", "raytrace"] | None,
+            Field(description="Optional render engine override ('software' or 'raytrace')."),
+        ] = None,
+        samples: Annotated[int, Field(ge=1, le=16, description="Raytracer samples per pixel.")] = 2,
         camera_id: Annotated[
             str | None, Field(description="Optional camera ID for timeline renders.")
         ] = None,
@@ -205,6 +210,8 @@ def register_anim_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSession
                 height=height,
                 mode=mode,
                 camera_id=camera_id,
+                engine=engine,
+                samples=samples,
             )
             if gif_p is not None:
                 gif_p.parent.mkdir(parents=True, exist_ok=True)

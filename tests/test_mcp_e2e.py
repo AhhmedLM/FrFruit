@@ -25,14 +25,14 @@ def _parse_text_json(result) -> dict:
     return json.loads(texts[0])
 
 
-async def test_mcp_discovery_surfaces_29_tools_resources_and_prompts(
+async def test_mcp_discovery_surfaces_34_tools_resources_and_prompts(
     mcp_session_and_client,
 ) -> None:
     _, client, _ = mcp_session_and_client
 
     tools = await client.list_tools()
     tool_names = {t.name for t in tools.tools}
-    assert len(tool_names) == 29
+    assert len(tool_names) == 34
     expected_tools = {
         "scene_new",
         "scene_open",
@@ -63,6 +63,11 @@ async def test_mcp_discovery_surfaces_29_tools_resources_and_prompts(
         "timeline_manage",
         "keyframe_manage",
         "render_animation",
+        "texture_library",
+        "post_process_manage",
+        "render_video_file",
+        "physics_manage",
+        "armature_rig",
     }
     assert expected_tools == tool_names
 
@@ -71,8 +76,10 @@ async def test_mcp_discovery_surfaces_29_tools_resources_and_prompts(
     assert {
         "frfruit://scene/summary",
         "frfruit://scene/document",
+        "frfruit://scene/postprocess",
         "frfruit://catalog/nodes",
         "frfruit://catalog/materials",
+        "frfruit://catalog/textures",
     }.issubset(uris)
 
     templates = await client.list_resource_templates()
@@ -458,3 +465,376 @@ async def test_mcp_error_handling_and_workspace_sandbox(
         {"object_id": "C1", "target_object_id": "P1", "operation": "difference"},
     )
     assert bad_csg.is_error is True
+
+
+async def test_mcp_advanced_pipeline_textures_physics_rig_raytrace_video_fbx(
+    mcp_session_and_client,
+) -> None:
+    _, client, workspace = mcp_session_and_client
+    _parse_text_json(await client.call_tool("scene_new", {"name": "AdvShowcase"}))
+
+    # Create column mesh + armature + auto rig + keyframe bend
+    _parse_text_json(
+        await client.call_tool(
+            "create_primitive",
+            {
+                "primitive": "cylinder",
+                "name": "RigCol",
+                "radius": 0.25,
+                "height": 1.6,
+                "segments": 12,
+                "location": [0.0, 0.0, 0.8],
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "texture_library",
+            {
+                "action": "generate_procedural",
+                "asset_id": "gold",
+                "object_id": "RigCol",
+                "resolution": "1k",
+            },
+        )
+    )
+    arm = _parse_text_json(
+        await client.call_tool(
+            "armature_rig",
+            {
+                "action": "create",
+                "name": "HeroArm",
+                "bones": [
+                    {"name": "root", "head": [0, 0, 0], "tail": [0, 0, 0.8]},
+                    {"name": "tip", "parent": "root", "head": [0, 0, 0.8], "tail": [0, 0, 1.6]},
+                ],
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "armature_rig",
+            {
+                "action": "auto_rig",
+                "armature_id": arm["armature_id"],
+                "mesh_object_id": "RigCol",
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "armature_rig",
+            {
+                "action": "keyframe_pose",
+                "armature_id": arm["armature_id"],
+                "bone_name": "tip",
+                "rotation_deg": [0.0, 45.0, 0.0],
+                "frame": 8,
+            },
+        )
+    )
+
+    # Add cloth banner and bake physics
+    _parse_text_json(
+        await client.call_tool(
+            "create_primitive",
+            {
+                "primitive": "plane",
+                "name": "Flag",
+                "size": [1.0, 1.0, 1.0],
+                "subdivisions": 6,
+                "location": [1.5, 0.0, 1.4],
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "physics_manage",
+            {
+                "action": "set_cloth",
+                "object_id": "Flag",
+                "pin_mode": "top_edge",
+                "wind": [1.5, 0.2, 0.0],
+            },
+        )
+    )
+    bake = _parse_text_json(
+        await client.call_tool(
+            "physics_manage", {"action": "bake", "frame_start": 1, "frame_end": 8}
+        )
+    )
+    assert len(bake["cloth_objects"]) == 1
+
+    # Switch to raytracer + cinematic postprocess & render viewport
+    pp = _parse_text_json(
+        await client.call_tool(
+            "post_process_manage",
+            {"action": "set_preset", "preset": "cinematic", "render_engine": "raytrace"},
+        )
+    )
+    assert pp["post_process"]["tone_mapper"] == "aces"
+    _parse_text_json(await client.call_tool("light_manage", {"action": "setup_studio_3point"}))
+
+    rt_vp = await client.call_tool(
+        "render_viewport",
+        {"mode": "pbr", "engine": "raytrace", "samples": 1, "width": 160, "height": 128},
+    )
+    assert any(isinstance(c, ImageContent) for c in rt_vp.content)
+
+    # Render MP4 turntable video
+    vid = _parse_text_json(
+        await client.call_tool(
+            "render_video_file",
+            {
+                "path": "renders/demo.mp4",
+                "kind": "timeline",
+                "frame_start": 1,
+                "frame_end": 4,
+                "fps": 12,
+                "width": 160,
+                "height": 128,
+                "engine": "software",
+            },
+        )
+    )
+    assert (workspace / "renders" / "demo.mp4").stat().st_size > 800
+    assert vid["format"] == "mp4"
+
+    # Export Unreal-ready Binary FBX 7.4
+    fbx = _parse_text_json(
+        await client.call_tool(
+            "export_scene",
+            {"path": "out/hero.fbx", "format": "fbx", "target_engine": "unreal"},
+        )
+    )
+    assert (workspace / "out" / "hero.fbx").read_bytes().startswith(b"Kaydara FBX Binary")
+    assert fbx["target_engine"] == "unreal"
+
+
+async def test_mcp_edit_mode_and_single_face_material_workflow(
+    mcp_session_and_client,
+) -> None:
+    _, client, workspace = mcp_session_and_client
+    _parse_text_json(await client.call_tool("scene_new", {"name": "EditModeShowcase"}))
+
+    cube = _parse_text_json(
+        await client.call_tool(
+            "create_primitive",
+            {"primitive": "cube", "name": "EditBox", "size": [1.2, 1.2, 1.2], "origin": "bottom"},
+        )
+    )
+    oid = cube["object_id"]
+
+    # Create two distinct materials: matte clay body + bright emissive single-face accent
+    mat_body = _parse_text_json(
+        await client.call_tool(
+            "material_create_or_assign",
+            {
+                "action": "create_and_assign",
+                "name": "BodyMat",
+                "base_color": "#384152",
+                "roughness": 0.65,
+                "object_id": oid,
+            },
+        )
+    )
+    mat_face = _parse_text_json(
+        await client.call_tool(
+            "material_create_or_assign",
+            {
+                "action": "create",
+                "name": "AccentFaceMat",
+                "base_color": "#ff9e2c",
+                "emission_color": "#ff9e2c",
+                "emission_strength": 1.4,
+            },
+        )
+    )
+    body_mid = mat_body["material"]["id"]
+    accent_mid = mat_face["material"]["id"]
+
+    # Assign accent material to ONLY face 0 (single-face material assignment)
+    f0_assign = _parse_text_json(
+        await client.call_tool(
+            "material_create_or_assign",
+            {
+                "action": "assign_faces",
+                "object_id": oid,
+                "material_id": accent_mid,
+                "face_index": 0,
+            },
+        )
+    )
+    assert f0_assign["assigned_faces"] == [0]
+    assert f0_assign["assigned_face_count"] == 1
+
+    # Inspect mesh elements: verify materials breakdown, faces, edges, selection preview
+    insp_mats = _parse_text_json(
+        await client.call_tool("mesh_inspect_topology", {"object_id": oid, "detail": "materials"})
+    )
+    assert insp_mats["elements"]["base_material_id"] == body_mid
+    assert insp_mats["elements"]["face_material_override_count"] == 1
+    assert insp_mats["elements"]["faces_by_material"][accent_mid] == [0]
+
+    insp_faces = _parse_text_json(
+        await client.call_tool(
+            "mesh_inspect_topology",
+            {"object_id": oid, "detail": "faces", "selection_mode": "top", "limit": 8},
+        )
+    )
+    assert len(insp_faces["elements"]["faces"]) == 8
+    assert len(insp_faces["elements"]["selection"]["selected_face_indices"]) >= 2
+
+    insp_edges = _parse_text_json(
+        await client.call_tool(
+            "mesh_inspect_topology",
+            {"object_id": oid, "detail": "edges", "limit": 6},
+        )
+    )
+    assert len(insp_edges["elements"]["edges"]) == 6
+
+    # Verify Edit Mode modeling ops preserve face 0's accent material while editing topology
+    ext_ind = _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": oid,
+                "operation": "extrude_individual",
+                "selection_mode": "top",
+                "distance": 0.25,
+                "scale": 0.75,
+            },
+        )
+    )
+    assert ext_ind["face_material_override_count"] >= 1
+    assert ext_ind["stats"]["face_count"] > 12
+
+    _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": oid,
+                "operation": "loop_cut",
+                "axis": "z",
+                "cuts": 1,
+                "slide": 0.1,
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": oid,
+                "operation": "poke_faces",
+                "selection_mode": "bottom",
+                "offset": 0.05,
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": oid,
+                "operation": "transform_selection",
+                "selection_mode": "top",
+                "translate": [0.05, 0.0, 0.1],
+                "proportional_radius": 0.4,
+                "proportional_falloff": "smooth",
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": oid,
+                "operation": "project_uvs",
+                "selection_mode": "all",
+                "projection": "box",
+            },
+        )
+    )
+    _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": oid,
+                "operation": "assign_face_material",
+                "selection_mode": "front",
+                "material_id": accent_mid,
+            },
+        )
+    )
+
+    # Bisect a second cube cleanly and separate selection into a new object
+    _parse_text_json(
+        await client.call_tool(
+            "create_primitive",
+            {"primitive": "cube", "name": "CutBox", "location": [2.2, 0.0, 0.0]},
+        )
+    )
+    bis_res = _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": "CutBox",
+                "operation": "bisect_plane",
+                "plane_point": [0.0, 0.0, 0.5],
+                "plane_normal": [0.0, 0.0, 1.0],
+                "clear_outer": True,
+                "fill_caps": True,
+            },
+        )
+    )
+    assert bis_res["stats"]["face_count"] > 0
+
+    sep_res = _parse_text_json(
+        await client.call_tool(
+            "mesh_edit",
+            {
+                "object_id": "CutBox",
+                "operation": "separate_selection",
+                "selection_mode": "top",
+                "separated_name": "CutTopCap",
+            },
+        )
+    )
+    assert sep_res["separated_object_name"] == "CutTopCap"
+
+    # Clear single-face overrides on face 0 and verify render works in both software & raytrace
+    clr = _parse_text_json(
+        await client.call_tool(
+            "material_create_or_assign",
+            {"action": "clear_faces", "object_id": oid, "face_index": 0},
+        )
+    )
+    assert 0 in clr["cleared_faces"]
+
+    _parse_text_json(await client.call_tool("light_manage", {"action": "setup_studio_3point"}))
+    sw_img = await client.call_tool(
+        "render_viewport",
+        {
+            "mode": "pbr",
+            "engine": "software",
+            "width": 160,
+            "height": 128,
+            "save_path": "renders/edit_sw.png",
+        },
+    )
+    rt_img = await client.call_tool(
+        "render_viewport",
+        {
+            "mode": "pbr",
+            "engine": "raytrace",
+            "samples": 1,
+            "width": 160,
+            "height": 128,
+            "save_path": "renders/edit_rt.png",
+        },
+    )
+    assert any(isinstance(c, ImageContent) for c in sw_img.content)
+    assert any(isinstance(c, ImageContent) for c in rt_img.content)
+    assert (workspace / "renders" / "edit_sw.png").read_bytes().startswith(b"\x89PNG")
+    assert (workspace / "renders" / "edit_rt.png").read_bytes().startswith(b"\x89PNG")

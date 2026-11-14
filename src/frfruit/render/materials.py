@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from frfruit.core.scene import MaterialSpec
+from frfruit.textures.loader import compute_triplanar_uvs, perturb_normals, sample_texture
 
 PRESET_MATERIALS: dict[str, dict[str, Any]] = {
     "clay": {
@@ -135,3 +136,72 @@ def evaluate_surface_albedo(mat: MaterialSpec, world_pos: np.ndarray) -> np.ndar
     )
     t = np.clip(0.5 + 0.5 * n, 0.0, 1.0)[:, None]
     return c1 * (1.0 - t) + c2 * t
+
+
+def evaluate_material_maps(
+    mat: MaterialSpec,
+    world_pos: np.ndarray,
+    normals_w: np.ndarray,
+    uvs: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate full PBR material channels (albedo, normal, roughness, metallic, ao) for K samples.
+
+    Combines procedural patterns with any attached bitmap texture maps (`albedo_map`,
+    `normal_map`, `roughness_map`, `metallic_map`, `ao_map`), falling back automatically to
+    world-space triplanar UVs for untextured meshes.
+    """
+    k = len(world_pos)
+    albedo = evaluate_surface_albedo(mat, world_pos)
+    nrm_out = normals_w.copy()
+    roughness = np.full((k, 1), float(mat.roughness), dtype=np.float64)
+    metallic = np.full((k, 1), float(mat.metallic), dtype=np.float64)
+    ao = np.ones((k, 1), dtype=np.float64)
+
+    if k == 0:
+        return albedo, nrm_out, roughness, metallic, ao
+
+    has_maps = any(
+        (
+            mat.albedo_map,
+            mat.normal_map,
+            mat.roughness_map,
+            mat.metallic_map,
+            mat.ao_map,
+        )
+    )
+    if not has_maps:
+        return albedo, nrm_out, roughness, metallic, ao
+
+    if uvs is not None and len(uvs) == k and np.all(np.isfinite(uvs)):
+        samp_uvs = uvs
+    else:
+        samp_uvs = compute_triplanar_uvs(world_pos, normals_w)
+    scale = (float(mat.uv_scale[0]), float(mat.uv_scale[1]))
+
+    if mat.albedo_map:
+        tex_alb = sample_texture(mat.albedo_map, samp_uvs, uv_scale=scale)
+        if tex_alb is not None:
+            tint = np.asarray(mat.base_color[:3], dtype=np.float64)[None, :]
+            albedo = np.clip(tex_alb * tint, 0.0, 1.0)
+
+    if mat.normal_map:
+        tex_nrm = sample_texture(mat.normal_map, samp_uvs, uv_scale=scale)
+        if tex_nrm is not None:
+            nrm_out = perturb_normals(nrm_out, tex_nrm, strength=0.85)
+
+    if mat.roughness_map:
+        tex_rgh = sample_texture(mat.roughness_map, samp_uvs, uv_scale=scale)
+        if tex_rgh is not None:
+            roughness = np.clip(tex_rgh[:, 0:1], 0.04, 1.0)
+
+    if mat.metallic_map:
+        tex_mtl = sample_texture(mat.metallic_map, samp_uvs, uv_scale=scale)
+        if tex_mtl is not None:
+            metallic = np.clip(tex_mtl[:, 0:1], 0.0, 1.0)
+
+    if mat.ao_map:
+        tex_ao = sample_texture(mat.ao_map, samp_uvs, uv_scale=scale)
+        if tex_ao is not None:
+            ao = np.clip(tex_ao[:, 0:1], 0.1, 1.0)
+
+    return albedo, nrm_out, roughness, metallic, ao

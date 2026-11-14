@@ -18,8 +18,9 @@ from frfruit.geometry.spatial import (
     compute_scene_bounds,
     evaluate_scene_meshes,
 )
+from frfruit.render.backend import RendererBackend, get_renderer
 from frfruit.render.camera import ViewDirection, auto_frame_camera_object, build_camera_matrices
-from frfruit.render.software import RenderConfig, RenderMode, SoftwareRenderer, image_to_png_bytes
+from frfruit.render.software import RenderConfig, RenderMode, image_to_png_bytes
 
 
 def _load_font(size: int = 13) -> ImageFont.ImageFont:
@@ -204,10 +205,13 @@ def render_single_view(
     show_axes: bool = True,
     show_bounds: bool = False,
     show_labels: bool = False,
-    renderer: SoftwareRenderer | None = None,
+    engine: str | None = None,
+    samples: int = 2,
+    renderer: RendererBackend | None = None,
 ) -> tuple[bytes, dict[str, object]]:
     """Render one view of the scene to PNG bytes plus metadata."""
-    rend = renderer or SoftwareRenderer()
+    engine_name = engine or scene.render_engine
+    rend = renderer or get_renderer(engine_name)
     evaluated = evaluate_scene_meshes(scene)
     cam = _resolve_camera(scene, evaluated, camera_id=camera_id, view_direction=view_direction)
 
@@ -226,9 +230,10 @@ def render_single_view(
         show_grid=show_grid,
         show_axes=show_axes,
         enable_shadows=(mode == "pbr"),
+        samples=samples,
     )
     img = rend.render_image(scene, evaluated, cam, config=cfg, colliding_ids=colliding_ids)
-    title = f"{cam.name} | {mode.upper()} | frame {scene.timeline.current_frame}"
+    title = f"{cam.name} | {mode.upper()} ({engine_name}) | frame {scene.timeline.current_frame}"
     img = annotate_viewport(
         img,
         evaluated,
@@ -243,6 +248,7 @@ def render_single_view(
         "width": width,
         "height": height,
         "mode": mode,
+        "engine": engine_name,
         "camera": cam.name,
         "object_count": len(evaluated),
         "frame": scene.timeline.current_frame,
@@ -262,10 +268,13 @@ def render_multiview_sheet(
     show_axes: bool = True,
     show_bounds: bool = False,
     show_labels: bool = True,
-    renderer: SoftwareRenderer | None = None,
+    engine: str | None = None,
+    samples: int = 2,
+    renderer: RendererBackend | None = None,
 ) -> tuple[bytes, dict[str, object]]:
     """Render a labeled 2x2 (or 2x3) multi-angle contact sheet into one PNG."""
-    rend = renderer or SoftwareRenderer()
+    engine_name = engine or scene.render_engine
+    rend = renderer or get_renderer(engine_name)
     evaluated = evaluate_scene_meshes(scene)
     bounds = compute_scene_bounds(evaluated)
 
@@ -288,6 +297,7 @@ def render_multiview_sheet(
         show_grid=show_grid,
         show_axes=show_axes,
         enable_shadows=(mode == "pbr"),
+        samples=samples,
     )
 
     for idx, vdir in enumerate(views):
@@ -326,6 +336,7 @@ def render_multiview_sheet(
         "sheet_height": rows * tile_height,
         "views": list(views),
         "mode": mode,
+        "engine": engine_name,
         "object_count": len(evaluated),
         "bounds_min": list(bounds.min_corner),
         "bounds_max": list(bounds.max_corner),
@@ -345,10 +356,13 @@ def render_animation_sequence(
     height: int = 270,
     mode: RenderMode = "pbr",
     camera_id: str | None = None,
-    renderer: SoftwareRenderer | None = None,
+    engine: str | None = None,
+    samples: int = 2,
+    renderer: RendererBackend | None = None,
 ) -> tuple[bytes, bytes, dict[str, object]]:
     """Render an animation or turntable into (filmstrip_png_bytes, animated_gif_bytes, meta)."""
-    rend = renderer or SoftwareRenderer()
+    engine_name = engine or scene.render_engine
+    rend = renderer or get_renderer(engine_name)
     fs = scene.timeline.frame_start if frame_start is None else frame_start
     fe = scene.timeline.frame_end if frame_end is None else frame_end
     count = max(2, min(24, int(steps)))
@@ -364,7 +378,14 @@ def render_animation_sequence(
         )
         center = np.asarray(bounds.center, dtype=np.float64)
         offset = np.asarray(base_cam.transform.location, dtype=np.float64) - center
-        cfg = RenderConfig(width=width, height=height, mode=mode, show_grid=True, show_axes=True)
+        cfg = RenderConfig(
+            width=width,
+            height=height,
+            mode=mode,
+            show_grid=True,
+            show_axes=True,
+            samples=samples,
+        )
         for i in range(count):
             ang = 2.0 * math.pi * (i / count)
             ca, sa = math.cos(ang), math.sin(ang)
@@ -390,7 +411,14 @@ def render_animation_sequence(
             frame_labels.append(f"{int(math.degrees(ang))}deg")
     else:
         frame_nums = [int(round(x)) for x in np.linspace(fs, fe, count)]
-        cfg = RenderConfig(width=width, height=height, mode=mode, show_grid=True, show_axes=True)
+        cfg = RenderConfig(
+            width=width,
+            height=height,
+            mode=mode,
+            show_grid=True,
+            show_axes=True,
+            samples=samples,
+        )
         for fnum in frame_nums:
             eval_doc = apply_animation_frame(scene, fnum)
             evaluated = evaluate_scene_meshes(eval_doc)
@@ -420,6 +448,7 @@ def render_animation_sequence(
 
     meta: dict[str, object] = {
         "kind": kind,
+        "engine": engine_name,
         "frames_rendered": len(frames_rgb),
         "labels": frame_labels,
         "filmstrip_size": [cols * width, rows * height],

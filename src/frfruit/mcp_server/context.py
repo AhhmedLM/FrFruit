@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +16,7 @@ from frfruit.core.scene import SceneDocument, SceneObject
 
 
 class FrFruitSession:
-    """Thread-safe active scene session with Undo/Redo and workspace path sandboxing."""
+    """Thread-safe active scene session with Undo/Redo, workspace sandboxing, and live listeners."""
 
     def __init__(self, workspace_root: str | Path | None = None) -> None:
         self._lock = threading.RLock()
@@ -23,6 +25,36 @@ class FrFruitSession:
         self.workspace_root: Path = Path(base).resolve()
         self.scene: SceneDocument = SceneDocument.new_default("FrFruitScene")
         self.history: HistoryManager = HistoryManager(max_entries=50)
+        self._listeners: list[Callable[[dict[str, Any]], None]] = []
+        self.audit_log: list[dict[str, Any]] = []
+
+    def add_listener(self, cb: Callable[[dict[str, Any]], None]) -> None:
+        with self._lock:
+            if cb not in self._listeners:
+                self._listeners.append(cb)
+
+    def remove_listener(self, cb: Callable[[dict[str, Any]], None]) -> None:
+        with self._lock:
+            self._listeners = [x for x in self._listeners if x is not cb]
+
+    def notify(self, event: str, data: dict[str, Any] | None = None) -> None:
+        payload: dict[str, Any] = {
+            "event": event,
+            "timestamp": time.time(),
+            "scene_name": self.scene.name,
+            "object_count": len(self.scene.objects),
+            "data": data or {},
+        }
+        with self._lock:
+            self.audit_log.append(payload)
+            if len(self.audit_log) > 200:
+                self.audit_log = self.audit_log[-200:]
+            listeners = list(self._listeners)
+        for cb in listeners:
+            try:
+                cb(payload)
+            except Exception:
+                pass
 
     def reset(self, name: str = "FrFruitScene", clear_history: bool = True) -> SceneDocument:
         with self._lock:
@@ -31,7 +63,9 @@ class FrFruitSession:
             else:
                 self.history.clear()
             self.scene = SceneDocument.new_default(name)
-            return self.scene
+            scene_out = self.scene
+        self.notify("scene_reset", {"name": name})
+        return scene_out
 
     def set_workspace_root(self, root: str | Path) -> Path:
         with self._lock:
@@ -55,6 +89,7 @@ class FrFruitSession:
 
     def push_history(self, label: str) -> None:
         self.history.push(self.scene, label)
+        self.notify("scene_mutated", {"action": label})
 
     def require_object(self, id_or_name: str, expected_kind: str | None = None) -> SceneObject:
         obj = self.scene.resolve_object(id_or_name)

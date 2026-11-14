@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FrFruit Studio Workstation</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app-shell">
+    <!-- TOP BAR -->
+    <header id="topbar">
+      <div class="brand-group">
+        <div class="brand-mark">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2">
+            <polygon points="12 2 21 7 21 17 12 22 3 17 3 7"></polygon>
+            <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+            <line x1="12" y1="22.08" x2="12" y2="12"></line>
+          </svg>
+          <span>FRFRUIT</span>
+        </div>
+        <span class="brand-sub">STUDIO 0.2</span>
+        <div class="sep-v"></div>
+        <div class="scene-badge" id="hdr-scene-name">FrFruitScene</div>
+        <div class="toolbar-group">
+          <button id="btn-new" title="New empty scene">New</button>
+          <select id="sel-demo" title="Load demo showcase preset">
+            <option value="">Load Showcase...</option>
+            <option value="pbr_showcase">PBR Materials Showcase</option>
+            <option value="physics_cloth">Cloth &amp; Rigid-Body Lab</option>
+          </select>
+          <button id="btn-open" title="Open .frf.json project in workspace">Open</button>
+          <button id="btn-save" title="Save .frf.json project in workspace">Save</button>
+          <div class="sep-v"></div>
+          <button id="btn-undo" title="Undo (Ctrl+Z)">Undo</button>
+          <button id="btn-redo" title="Redo (Ctrl+Y)">Redo</button>
+        </div>
+      </div>
+
+      <div class="toolbar-group">
+        <select id="sel-add-prim" title="Add mesh primitive">
+          <option value="">+ Add Mesh...</option>
+          <option value="cube">Cube</option>
+          <option value="uv_sphere">UV Sphere</option>
+          <option value="icosphere">Icosphere</option>
+          <option value="cylinder">Cylinder</option>
+          <option value="cone">Cone</option>
+          <option value="plane">Subdivided Plane</option>
+          <option value="torus">Torus</option>
+        </select>
+        <div class="sep-v"></div>
+        <span class="mono" style="font-size:10.5px;color:var(--text-muted)">ENGINE</span>
+        <select id="hdr-engine">
+          <option value="software">Software PBR</option>
+          <option value="raytrace">Path Tracer (BVH)</option>
+        </select>
+        <button id="btn-mcp-pill" class="mcp-status-btn" title="Open MCP Connector Console">
+          <span class="led offline" id="mcp-led"></span>
+          <span id="mcp-pill-text">MCP CONNECTING</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- MAIN 3-COLUMN WORKSPACE -->
+    <div id="workspace">
+      <!-- LEFT: OUTLINER -->
+      <aside id="left-dock" class="dock">
+        <div class="dock-header">
+          <span>Scene Outliner</span>
+          <span class="mono" id="outliner-count">0</span>
+        </div>
+        <div class="outliner-search">
+          <input type="text" id="outliner-filter" placeholder="Filter objects..." />
+        </div>
+        <div id="outliner-list"></div>
+        <div class="dock-footer mono">
+          <div><span style="color:var(--text-muted)">VERTS</span> <span id="stat-verts">0</span></div>
+          <div><span style="color:var(--text-muted)">FACES</span> <span id="stat-faces">0</span></div>
+          <div><span style="color:var(--text-muted)">MATS</span> <span id="stat-mats">0</span></div>
+        </div>
+      </aside>
+
+      <!-- CENTER: VIEWPORT & TIMELINE -->
+      <main id="center-column">
+        <div id="viewport-toolbar">
+          <div class="toolbar-group">
+            <div class="segmented" id="edit-mode-switch" title="Toggle Object / Edit Mode (Tab)">
+              <button id="btn-mode-object" class="active">Object</button>
+              <button id="btn-mode-edit">Edit</button>
+            </div>
+            <div class="segmented" id="edit-elem-switch" style="display:none" title="Edit Mode Element Select">
+              <button data-elem="vertex">Vert</button>
+              <button data-elem="edge">Edge</button>
+              <button data-elem="face" class="active">Face</button>
+            </div>
+            <div class="sep-v"></div>
+            <div class="segmented" id="mode-tabs">
+              <button data-mode="pbr" class="active">PBR</button>
+              <button data-mode="clay">Clay</button>
+              <button data-mode="wireframe">Wire</button>
+              <button data-mode="normals">Normals</button>
+            </div>
+            <div class="sep-v"></div>
+            <button id="tgl-grid" class="active">Grid</button>
+            <button id="tgl-axes" class="active">Axes</button>
+            <button id="tgl-bounds">Bounds</button>
+            <button id="tgl-bones" class="active">Bones</button>
+          </div>
+
+          <div class="toolbar-group">
+            <div class="segmented" id="cam-presets">
+              <button data-cam="iso">ISO</button>
+              <button data-cam="front">Front</button>
+              <button data-cam="right">Right</button>
+              <button data-cam="top">Top</button>
+              <button data-cam="fit">Fit (F)</button>
+            </div>
+            <div class="sep-v"></div>
+            <div class="segmented" id="vp-source-switch">
+              <button id="btn-src-gl" class="active">3D WebGL</button>
+              <button id="btn-src-cpu">CPU Render</button>
+            </div>
+            <button id="btn-render-frame" class="primary">Render Frame</button>
+          </div>
+        </div>
+
+        <div id="viewport-stage">
+          <canvas id="gl-canvas"></canvas>
+          <div id="cpu-render-overlay">
+            <img id="cpu-render-img" alt="CPU / PathTracer Render Output" />
+          </div>
+          <div id="vp-hud-tl" class="vp-hud">
+            <div><strong style="color:var(--text-primary)" id="hud-cam-label">PERSP Z-UP</strong> · <span id="hud-mode-label">PBR</span></div>
+            <div id="hud-sel-label">Selection: None</div>
+          </div>
+          <div id="vp-hud-tr" class="vp-hud">LMB Orbit · Shift+LMB Pan · Wheel Zoom · F Focus</div>
+          <div id="toast-bar"></div>
+        </div>
+
+        <div id="timeline-bar">
+          <div class="toolbar-group">
+            <button id="tl-start" class="icon-btn" title="Jump to start">|&lt;</button>
+            <button id="tl-play" title="Play / Pause animation">Play</button>
+            <button id="tl-end" class="icon-btn" title="Jump to end">&gt;|</button>
+          </div>
+          <span class="mono" style="font-size:10.5px;color:var(--text-secondary)">FRAME</span>
+          <input type="number" id="tl-frame-num" class="mono" style="width:58px" value="1" />
+          <input type="range" id="tl-slider" min="1" max="60" value="1" />
+          <span class="mono" style="font-size:10.5px;color:var(--text-muted)">
+            RANGE <span id="tl-range-lbl">1..60</span> @ <span id="tl-fps-lbl">24</span>fps
+          </span>
+        </div>
+      </main>
+
+      <!-- RIGHT: TABBED INSPECTOR -->
+      <aside id="right-dock" class="dock">
+        <div class="tab-bar" id="inspector-tabs">
+          <button class="tab-btn active" data-tab="prop">Prop</button>
+          <button class="tab-btn" data-tab="edit">Edit</button>
+          <button class="tab-btn" data-tab="tex">Tex</button>
+          <button class="tab-btn" data-tab="phys">Phys</button>
+          <button class="tab-btn" data-tab="post">Post</button>
+          <button class="tab-btn" data-tab="out">Out</button>
+          <button class="tab-btn" data-tab="mcp">MCP</button>
+        </div>
+
+        <div class="inspector-body">
+          <!-- TAB 1: OBJECT PROPERTIES -->
+          <div class="tab-pane active" id="tab-prop">
+            <div id="no-selection-msg" class="section-card" style="color:var(--text-secondary)">
+              Select an object in the Scene Outliner or click "+ Add Mesh" above to inspect transforms, materials, and physics.
+            </div>
+            <div id="prop-editor" style="display:none">
+              <div class="section-card">
+                <div class="section-title">
+                  <span>Object Transform</span>
+                  <span class="mono" id="prop-kind-badge">MESH</span>
+                </div>
+                <div class="prop-row">
+                  <span class="prop-label">Name</span>
+                  <input type="text" id="prop-name" />
+                </div>
+                <div class="prop-row">
+                  <span class="prop-label">Location (m)</span>
+                  <div class="vec3-grid">
+                    <input type="number" step="0.1" class="ax-x" id="loc-x" />
+                    <input type="number" step="0.1" class="ax-y" id="loc-y" />
+                    <input type="number" step="0.1" class="ax-z" id="loc-z" />
+                  </div>
+                </div>
+                <div class="prop-row">
+                  <span class="prop-label">Rotation (deg)</span>
+                  <div class="vec3-grid">
+                    <input type="number" step="5" class="ax-x" id="rot-x" />
+                    <input type="number" step="5" class="ax-y" id="rot-y" />
+                    <input type="number" step="5" class="ax-z" id="rot-z" />
+                  </div>
+                </div>
+                <div class="prop-row">
+                  <span class="prop-label">Scale</span>
+                  <div class="vec3-grid">
+                    <input type="number" step="0.1" class="ax-x" id="scl-x" />
+                    <input type="number" step="0.1" class="ax-y" id="scl-y" />
+                    <input type="number" step="0.1" class="ax-z" id="scl-z" />
+                  </div>
+                </div>
+                <div class="btn-row" style="margin-top:8px">
+                  <button id="btn-apply-transform" class="primary">Apply Transform</button>
+                  <button id="btn-delete-obj" style="color:#f87171">Delete</button>
+                </div>
+              </div>
+
+              <div class="section-card">
+                <div class="section-title">Material &amp; Topology</div>
+                <div class="prop-row">
+                  <span class="prop-label">Material</span>
+                  <select id="prop-material"></select>
+                </div>
+                <div class="prop-row">
+                  <span class="prop-label">Geometry</span>
+                  <span class="mono" id="prop-topo-lbl">-</span>
+                </div>
+                <div class="prop-row">
+                  <span class="prop-label">Dimensions</span>
+                  <span class="mono" id="prop-dims-lbl">-</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 2: EDIT MODE MODELING & PER-FACE MATERIALS -->
+          <div class="tab-pane" id="tab-edit">
+            <div class="section-card">
+              <div class="section-title">
+                <span>Element Selection</span>
+                <span class="mono" id="edit-sel-summary">0F · 0E · 0V</span>
+              </div>
+              <div style="font-size:10.5px;color:var(--text-secondary);margin-bottom:6px">
+                Click mesh in viewport to pick. Shift+Click toggles multi-select.
+              </div>
+              <div class="edit-grid-3" id="edit-quick-sel">
+                <button data-qsel="top">Top</button>
+                <button data-qsel="bottom">Bottom</button>
+                <button data-qsel="front">Front</button>
+                <button data-qsel="right">Side</button>
+                <button data-qsel="all">All</button>
+                <button data-qsel="boundary">Boundary</button>
+                <button id="btn-sel-coplanar">Coplanar</button>
+                <button id="btn-sel-invert">Invert</button>
+                <button id="btn-sel-clear">Clear</button>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">
+                <span>Per-Face Material Slot</span>
+                <span class="mono" id="edit-fmat-count">0 overrides</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Face Material</span>
+                <select id="edit-face-mat"></select>
+              </div>
+              <div class="btn-row" style="margin-top:6px">
+                <button id="btn-assign-face-mat" class="primary">Assign to Face(s)</button>
+                <button id="btn-clear-face-mat">Clear Face(s)</button>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Extrude, Inset &amp; Bevel</div>
+              <div class="prop-row">
+                <span class="prop-label">Dist / W / Segs</span>
+                <div class="vec3-grid">
+                  <input type="number" id="ed-dist" value="0.25" step="0.05" title="Extrude / Shrink distance" />
+                  <input type="number" id="ed-width" value="0.05" step="0.01" min="0.002" title="Inset / Bevel width" />
+                  <input type="number" id="ed-segs" value="1" min="1" max="8" title="Segments" />
+                </div>
+              </div>
+              <div class="edit-grid" style="margin-top:6px">
+                <button data-edop="extrude_faces" class="primary">Extrude Region</button>
+                <button data-edop="extrude_individual">Extrude Indiv.</button>
+                <button data-edop="extrude_along_normals">Extrude Normals</button>
+                <button data-edop="extrude_manifold">Extrude Manifold</button>
+                <button data-edop="extrude_edges">Extrude Edges</button>
+                <button data-edop="extrude_vertices">Extrude Verts</button>
+                <button data-edop="inset_faces">Inset Faces</button>
+                <button data-edop="inset_individual">Inset Indiv.</button>
+                <button data-edop="bevel_edges">Bevel Edges</button>
+                <button data-edop="bevel_vertices">Bevel Verts</button>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Cut, Detail &amp; Shell</div>
+              <div class="prop-row">
+                <span class="prop-label">Cuts / Slide / Ax</span>
+                <div class="vec3-grid">
+                  <input type="number" id="ed-cuts" value="1" min="1" max="12" title="Loop/Subdiv Cuts" />
+                  <input type="number" id="ed-slide" value="0.0" step="0.1" min="-1" max="1" title="Loop Cut Slide" />
+                  <select id="ed-axis" title="Cut / Symmetrize Axis">
+                    <option value="z">Z</option>
+                    <option value="x">X</option>
+                    <option value="y">Y</option>
+                  </select>
+                </div>
+              </div>
+              <div class="edit-grid" style="margin-top:6px">
+                <button data-edop="loop_cut">Loop Cut</button>
+                <button data-edop="subdivide">Subdivide</button>
+                <button data-edop="poke_faces">Poke Faces</button>
+                <button data-edop="bisect_plane">Bisect Half</button>
+                <button data-edop="bridge_edge_loops">Bridge Loops</button>
+                <button data-edop="fill_holes">Fill Holes</button>
+                <button data-edop="solidify_faces">Solidify</button>
+                <button data-edop="wireframe_edges">Wireframe</button>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Topology, Normals &amp; Deform</div>
+              <div class="prop-row">
+                <span class="prop-label">Factor / UV</span>
+                <div class="vec3-grid" style="grid-template-columns:1fr 1.6fr">
+                  <input type="number" id="ed-factor" value="0.5" step="0.1" min="-2" max="2" title="Smooth / Sphere Factor" />
+                  <select id="ed-uv-proj">
+                    <option value="box">UV: Box</option>
+                    <option value="planar_z">UV: Planar Z</option>
+                    <option value="cylindrical">UV: Cylindrical</option>
+                    <option value="spherical">UV: Spherical</option>
+                  </select>
+                </div>
+              </div>
+              <div class="edit-grid" style="margin-top:6px">
+                <button data-edop="merge_vertices">Merge By Dist</button>
+                <button data-edop="duplicate_faces">Duplicate</button>
+                <button data-edop="separate_selection">Separate</button>
+                <button data-edop="delete_elements" style="color:#f87171">Delete Sel.</button>
+                <button data-edop="dissolve_faces">Dissolve</button>
+                <button data-edop="split_selection">Split Sel.</button>
+                <button data-edop="shrink_fatten">Shrink/Fatten</button>
+                <button data-edop="to_sphere">To Sphere</button>
+                <button data-edop="smooth">Smooth</button>
+                <button data-edop="symmetrize">Symmetrize</button>
+                <button data-edop="flip_normals">Flip Normals</button>
+                <button data-edop="recompute_normals">Recalc Normals</button>
+                <button data-edop="project_uvs">Project UVs</button>
+                <button data-edop="repair_manifold">Repair Mesh</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 2: TEXTURE LIBRARY -->
+          <div class="tab-pane" id="tab-tex">
+            <div class="section-card">
+              <div class="section-title">Online PBR Texture Fetcher</div>
+              <div class="prop-row">
+                <span class="prop-label">Query</span>
+                <input type="text" id="tex-query" placeholder="marble, gold, wood, fabric..." />
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Provider</span>
+                <select id="tex-source">
+                  <option value="all">All (Poly Haven + ambientCG + Procedural)</option>
+                  <option value="polyhaven">Poly Haven (polyhaven.com)</option>
+                  <option value="ambientcg">ambientCG (ambientcg.com)</option>
+                  <option value="procedural">Local Procedural PBR</option>
+                </select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Resolution</span>
+                <div class="vec3-grid" style="grid-template-columns:1fr 1fr 1fr">
+                  <select id="tex-res">
+                    <option value="1k">1K</option>
+                    <option value="2k">2K</option>
+                    <option value="4k">4K</option>
+                  </select>
+                  <input type="number" id="tex-uv-u" value="1" step="0.5" title="UV Tile U" />
+                  <input type="number" id="tex-uv-v" value="1" step="0.5" title="UV Tile V" />
+                </div>
+              </div>
+              <div class="btn-row" style="margin-top:8px">
+                <button id="btn-tex-search" class="primary">Search Textures</button>
+              </div>
+              <div class="tex-list" id="tex-results"></div>
+            </div>
+          </div>
+
+          <!-- TAB 3: PHYSICS & CLOTH -->
+          <div class="tab-pane" id="tab-phys">
+            <div class="section-card">
+              <div class="section-title">Cloth Solver (XPBD)</div>
+              <div class="prop-row">
+                <span class="prop-label">Pin Preset</span>
+                <select id="cloth-pin">
+                  <option value="top_corners">Top Corners (Banner)</option>
+                  <option value="top_edge">Top Edge (Curtain)</option>
+                  <option value="border">Border</option>
+                  <option value="none">Free Drape (None)</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Stiffness</span>
+                <input type="range" id="cloth-stiff" min="0.1" max="1" step="0.02" value="0.92" />
+                <span class="slider-val" id="cloth-stiff-v">0.92</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Wind (X/Y/Z)</span>
+                <div class="vec3-grid">
+                  <input type="number" step="0.2" id="wind-x" value="1.2" class="ax-x" />
+                  <input type="number" step="0.2" id="wind-y" value="0.2" class="ax-y" />
+                  <input type="number" step="0.2" id="wind-z" value="0.0" class="ax-z" />
+                </div>
+              </div>
+              <button id="btn-set-cloth" style="width:100%;margin-top:6px">Assign Cloth to Selected</button>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Rigid Body Collider</div>
+              <div class="prop-row">
+                <span class="prop-label">Body Type</span>
+                <select id="rb-type">
+                  <option value="dynamic">Dynamic (Gravity + Bounce)</option>
+                  <option value="static">Static Obstacle</option>
+                </select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Collider</span>
+                <select id="rb-shape">
+                  <option value="box">Box (AABB)</option>
+                  <option value="sphere">Sphere</option>
+                </select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Bounce / Fric</span>
+                <div class="vec3-grid" style="grid-template-columns:1fr 1fr">
+                  <input type="number" id="rb-rest" value="0.55" step="0.05" min="0" max="1" />
+                  <input type="number" id="rb-fric" value="0.50" step="0.05" min="0" max="1.5" />
+                </div>
+              </div>
+              <button id="btn-set-rb" style="width:100%;margin-top:6px">Assign Rigid Body to Selected</button>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Simulation Bake</div>
+              <div class="prop-row">
+                <span class="prop-label">Frames / Floor</span>
+                <div class="vec3-grid">
+                  <input type="number" id="phys-fs" value="1" />
+                  <input type="number" id="phys-fe" value="36" />
+                  <input type="number" id="phys-gz" value="0.0" step="0.1" />
+                </div>
+              </div>
+              <div class="btn-row" style="margin-top:8px">
+                <button id="btn-phys-bake" class="warn-btn">Bake Physics</button>
+                <button id="btn-phys-clear">Clear Cache</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 4: POST-FX & RENDER ENGINE -->
+          <div class="tab-pane" id="tab-post">
+            <div class="section-card">
+              <div class="section-title">Render Engine &amp; Presets</div>
+              <div class="prop-row">
+                <span class="prop-label">Backend</span>
+                <select id="pp-engine">
+                  <option value="software">Software PBR Rasterizer</option>
+                  <option value="raytrace">BVH Path Tracer (Raytrace)</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">RT Samples</span>
+                <input type="range" id="pp-samples" min="1" max="8" step="1" value="2" />
+                <span class="slider-val" id="pp-samples-v">2</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Post Preset</span>
+                <select id="pp-preset">
+                  <option value="cinematic">Cinematic</option>
+                  <option value="architectural">Architectural</option>
+                  <option value="studio_clean">Studio Clean</option>
+                  <option value="dramatic_bloom">Dramatic Bloom</option>
+                  <option value="raw_off">Raw (Post-FX Off)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">HDR Compositor &amp; Grading</div>
+              <div class="checkbox-row">
+                <span class="prop-label">Master Post-Processing</span>
+                <input type="checkbox" id="pp-enabled" checked />
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Tone Mapper</span>
+                <select id="pp-tonemap">
+                  <option value="aces">ACES Filmic</option>
+                  <option value="filmic">Filmic (Hable)</option>
+                  <option value="reinhard">Reinhard</option>
+                  <option value="none">Linear Clamp</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Exposure EV</span>
+                <input type="range" id="pp-exposure" min="-2" max="2" step="0.05" value="0" />
+                <span class="slider-val" id="pp-exposure-v">0.00</span>
+              </div>
+              <div class="checkbox-row">
+                <span class="prop-label">HDR Bloom</span>
+                <input type="checkbox" id="pp-bloom-on" checked />
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Bloom Int.</span>
+                <input type="range" id="pp-bloom-int" min="0" max="1.5" step="0.02" value="0.22" />
+                <span class="slider-val" id="pp-bloom-int-v">0.22</span>
+              </div>
+              <div class="checkbox-row">
+                <span class="prop-label">SSAO Occlusion</span>
+                <input type="checkbox" id="pp-ssao-on" checked />
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">SSAO Strength</span>
+                <input type="range" id="pp-ssao-str" min="0" max="1.2" step="0.02" value="0.32" />
+                <span class="slider-val" id="pp-ssao-str-v">0.32</span>
+              </div>
+              <div class="checkbox-row">
+                <span class="prop-label">Depth of Field</span>
+                <input type="checkbox" id="pp-dof-on" />
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Vignette</span>
+                <input type="range" id="pp-vig" min="0" max="0.8" step="0.02" value="0.12" />
+                <span class="slider-val" id="pp-vig-v">0.12</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Chromatic Ab.</span>
+                <input type="range" id="pp-ca" min="0" max="3" step="0.1" value="0" />
+                <span class="slider-val" id="pp-ca-v">0.0</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Saturation</span>
+                <input type="range" id="pp-sat" min="0" max="2" step="0.05" value="1.05" />
+                <span class="slider-val" id="pp-sat-v">1.05</span>
+              </div>
+              <div class="checkbox-row">
+                <span class="prop-label">FXAA Anti-Aliasing</span>
+                <input type="checkbox" id="pp-fxaa" checked />
+              </div>
+              <div class="btn-row" style="margin-top:8px">
+                <button id="btn-pp-apply" class="primary">Apply &amp; Render Preview</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 5: GAME-READY FBX & VIDEO EXPORT -->
+          <div class="tab-pane" id="tab-out">
+            <div class="section-card">
+              <div class="section-title">Game-Ready FBX / 3D Export</div>
+              <div class="prop-row">
+                <span class="prop-label">Format</span>
+                <select id="exp-format">
+                  <option value="fbx">FBX Binary 7.4 (.fbx)</option>
+                  <option value="fbx_ascii">FBX ASCII (.fbx)</option>
+                  <option value="glb">GLB Binary PBR (.glb)</option>
+                  <option value="gltf">GLTF (.gltf)</option>
+                  <option value="obj">Wavefront (.obj)</option>
+                  <option value="stl">STL Mesh (.stl)</option>
+                  <option value="py">Blender Python (.py)</option>
+                </select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Engine Preset</span>
+                <select id="exp-engine">
+                  <option value="unreal">Unreal Engine 5 (Z-Up)</option>
+                  <option value="unity">Unity (Y-Up)</option>
+                  <option value="godot">Godot 4 (Y-Up)</option>
+                  <option value="generic">Generic Standard</option>
+                </select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Output Path</span>
+                <input type="text" id="exp-path" value="exports/asset.fbx" class="mono" />
+              </div>
+              <button id="btn-export-run" class="primary" style="width:100%;margin-top:6px">Export 3D Asset</button>
+              <div id="exp-result" class="result-banner" style="display:none"></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Video Sequence Renderer</div>
+              <div class="prop-row">
+                <span class="prop-label">Output File</span>
+                <input type="text" id="vid-path" value="renders/turntable.mp4" class="mono" />
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Sequence</span>
+                <select id="vid-kind">
+                  <option value="turntable">Turntable 360°</option>
+                  <option value="timeline">Timeline + Cloth</option>
+                </select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Size / FPS</span>
+                <div class="vec3-grid">
+                  <input type="number" id="vid-w" value="640" />
+                  <input type="number" id="vid-h" value="480" />
+                  <input type="number" id="vid-fps" value="24" />
+                </div>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Frames (S..E)</span>
+                <div class="vec3-grid" style="grid-template-columns:1fr 1fr">
+                  <input type="number" id="vid-fs" value="1" />
+                  <input type="number" id="vid-fe" value="36" />
+                </div>
+              </div>
+              <button id="btn-vid-run" class="primary" style="width:100%;margin-top:6px">Render Video (MP4 / GIF)</button>
+              <div id="vid-result" class="result-banner" style="display:none"></div>
+            </div>
+          </div>
+
+          <!-- TAB 6: LIVE MCP CONNECTOR CONSOLE -->
+          <div class="tab-pane" id="tab-mcp">
+            <div class="section-card">
+              <div class="section-title">
+                <span>MCP Bridge Endpoints</span>
+                <span class="mono" id="mcp-tools-badge">34 TOOLS</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">HTTP (Stream)</span>
+                <input type="text" id="mcp-url-http" class="mono" readonly />
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">SSE Stream</span>
+                <input type="text" id="mcp-url-sse" class="mono" readonly />
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">WS Telemetry</span>
+                <input type="text" id="mcp-url-ws" class="mono" readonly />
+              </div>
+              <div class="btn-row" style="margin-top:8px">
+                <button id="btn-copy-http">Copy Streamable JSON</button>
+                <button id="btn-copy-stdio">Copy Stdio JSON</button>
+              </div>
+              <pre class="code-box" id="mcp-config-preview">{}</pre>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">
+                <span>Live MCP / Engine Event Stream</span>
+                <button id="btn-clear-audit" style="height:20px;padding:0 6px;font-size:10px">Clear</button>
+              </div>
+              <div class="audit-feed" id="mcp-audit-feed">
+                <div class="audit-entry">Waiting for telemetry events...</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- BOTTOM STATUS BAR -->
+    <footer id="statusbar" class="mono">
+      <div id="sb-workspace">Workspace: -</div>
+      <div id="sb-telemetry">Engine: software | Meshes: 0</div>
+    </footer>
+  </div>
+
+  <script src="/viewport_gl.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

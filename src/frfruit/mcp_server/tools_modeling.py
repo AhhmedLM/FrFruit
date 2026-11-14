@@ -28,15 +28,9 @@ from frfruit.core.scene import (
 from frfruit.core.types import SelectionQuery, Transform, Vec2, Vec3
 from frfruit.geometry.curves import extrude_2d_profile, revolve_profile, sweep_curve
 from frfruit.geometry.edit_ops import (
-    bevel_edges,
     boolean_meshes,
-    extrude_faces,
-    inset_faces,
-    recompute_normals,
-    repair_manifold,
-    smooth_laplacian,
-    subdivide_mesh,
-    transform_selection,
+    inspect_mesh_elements,
+    run_edit_operation,
 )
 from frfruit.geometry.mesh import GeometryError, MeshData
 from frfruit.geometry.primitives import (
@@ -401,15 +395,43 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
         operation: Annotated[
             Literal[
                 "extrude_faces",
+                "extrude_individual",
+                "extrude_along_normals",
+                "extrude_manifold",
+                "extrude_edges",
+                "extrude_vertices",
                 "inset_faces",
                 "bevel_edges",
+                "bevel_vertices",
                 "subdivide",
+                "loop_cut",
+                "bisect_plane",
+                "poke_faces",
+                "bridge_edge_loops",
+                "fill_holes",
+                "solidify_faces",
+                "wireframe_edges",
+                "merge_vertices",
+                "delete_elements",
+                "dissolve_faces",
+                "duplicate_faces",
+                "split_selection",
+                "separate_selection",
                 "transform_selection",
+                "shrink_fatten",
+                "to_sphere",
+                "shear",
+                "symmetrize",
+                "randomize_vertices",
                 "smooth",
+                "flip_normals",
                 "recompute_normals",
                 "repair_manifold",
+                "project_uvs",
+                "assign_face_material",
+                "clear_face_materials",
             ],
-            Field(description="Edit Mesh operation to apply destructively to base mesh."),
+            Field(description="Edit Mode modeling operation to apply to base mesh."),
         ],
         selection_mode: Annotated[
             Literal[
@@ -423,13 +445,18 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
                 "normal_dir",
                 "bbox",
                 "indices",
+                "vertex_indices",
+                "edge_indices",
+                "coplanar",
+                "boundary",
+                "material",
             ],
-            Field(description="Semantic selection rule for face-based edit operations."),
+            Field(description="Semantic selection rule for Edit Mode geometry selection."),
         ] = "top",
         direction: Annotated[
-            Vec3 | None, Field(description="Custom direction when selection_mode='normal_dir'.")
+            Vec3 | None, Field(description="Direction vector for selection or extrude/cut.")
         ] = None,
-        angle_threshold_deg: Annotated[float, Field(ge=1.0, le=180.0)] = 45.0,
+        angle_threshold_deg: Annotated[float, Field(ge=0.5, le=180.0)] = 45.0,
         bbox_min: Annotated[
             Vec3 | None, Field(description="Selection box min when selection_mode='bbox'.")
         ] = None,
@@ -440,36 +467,165 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
             list[int] | None,
             Field(description="Explicit face indices when selection_mode='indices'."),
         ] = None,
-        distance: Annotated[float, Field(description="Extrude distance.")] = 0.3,
-        thickness: Annotated[float, Field(gt=0.0, description="Inset thickness.")] = 0.1,
-        depth: Annotated[float, Field(description="Inset depth offset.")] = 0.0,
-        width: Annotated[float, Field(gt=0.0, description="Bevel width.")] = 0.04,
-        segments: Annotated[int, Field(ge=1, le=4, description="Bevel segments.")] = 1,
+        vertex_indices: Annotated[
+            list[int] | None,
+            Field(description="Explicit vertex indices when selection_mode='vertex_indices'."),
+        ] = None,
+        edge_indices: Annotated[
+            list[list[int]] | None,
+            Field(description="Explicit [u, v] edge pairs when selection_mode='edge_indices'."),
+        ] = None,
+        seed_face: Annotated[
+            int | None, Field(ge=0, description="Seed face index for coplanar flood-fill.")
+        ] = None,
+        selection_material_id: Annotated[
+            str | None, Field(description="Material ID filter when selection_mode='material'.")
+        ] = None,
+        invert: Annotated[bool, Field(description="Invert resolved selection.")] = False,
+        distance: Annotated[
+            float, Field(description="Extrude / shrink-fatten displacement distance.")
+        ] = 0.3,
+        thickness: Annotated[float, Field(gt=0.0, description="Inset / solidify thickness.")] = 0.1,
+        depth: Annotated[float, Field(description="Inset or poke depth offset.")] = 0.0,
+        width: Annotated[
+            float, Field(gt=0.0, description="Bevel / wireframe / strut width.")
+        ] = 0.04,
+        segments: Annotated[int, Field(ge=1, le=16, description="Bevel or bridge segments.")] = 1,
         levels: Annotated[int, Field(ge=1, le=3, description="Subdivision levels.")] = 1,
+        cuts: Annotated[
+            int, Field(ge=1, le=12, description="Loop cut or subdivide cuts count.")
+        ] = 1,
+        slide: Annotated[
+            float, Field(ge=-1.0, le=1.0, description="Loop cut slide offset (-1..1).")
+        ] = 0.0,
         smooth_subdiv: Annotated[
-            bool, Field(description="Use Loop smoothing during subdivision.")
+            bool, Field(description="Use Loop smoothing during whole-mesh subdivision.")
         ] = True,
-        scale: Annotated[float, Field(gt=0.0, description="Uniform face scale for extrude.")] = 1.0,
-        translate: Annotated[Vec3, Field(description="Translation for transform_selection.")] = (
-            0.0,
-            0.0,
-            0.0,
-        ),
-        rotate_deg: Annotated[
-            Vec3, Field(description="Rotation in degrees for transform_selection.")
-        ] = (0.0, 0.0, 0.0),
+        individual: Annotated[
+            bool, Field(description="Extrude or inset each selected face individually.")
+        ] = False,
+        along_normals: Annotated[
+            bool, Field(description="Extrude vertices along individual averaged normals.")
+        ] = False,
+        scale: Annotated[float, Field(gt=0.0, description="Uniform scale factor.")] = 1.0,
+        translate: Annotated[Vec3, Field(description="Translation vector.")] = (0.0, 0.0, 0.0),
+        rotate_deg: Annotated[Vec3, Field(description="Rotation Euler degrees.")] = (0.0, 0.0, 0.0),
+        scale_vec: Annotated[Vec3 | None, Field(description="Non-uniform XYZ scale.")] = None,
         iterations: Annotated[int, Field(ge=1, le=25, description="Smoothing iterations.")] = 2,
         factor: Annotated[
-            float, Field(ge=0.0, le=1.0, description="Laplacian smooth factor.")
+            float, Field(ge=-5.0, le=5.0, description="Smooth / to_sphere / shear / jitter factor.")
         ] = 0.5,
+        axis: Annotated[
+            Literal["x", "y", "z"], Field(description="Primary axis for loop_cut or shear.")
+        ] = "z",
+        shear_axis: Annotated[
+            Literal["x", "y", "z"], Field(description="Secondary axis for shear.")
+        ] = "z",
+        plane_point: Annotated[
+            Vec3, Field(description="Plane point for bisect_plane / loop_cut.")
+        ] = (0.0, 0.0, 0.0),
+        plane_normal: Annotated[Vec3, Field(description="Plane normal for bisect_plane.")] = (
+            0.0,
+            0.0,
+            1.0,
+        ),
+        clear_inner: Annotated[bool, Field(description="Bisect: remove negative half.")] = False,
+        clear_outer: Annotated[bool, Field(description="Bisect: remove positive half.")] = False,
+        fill_caps: Annotated[bool, Field(description="Bisect: cap sliced openings.")] = True,
+        merge_mode: Annotated[
+            Literal["by_distance", "at_center"], Field(description="Vertex merge strategy.")
+        ] = "by_distance",
+        merge_distance: Annotated[
+            float, Field(gt=0.0, description="Distance threshold for merge by_distance.")
+        ] = 1e-4,
+        delete_mode: Annotated[
+            Literal["faces", "vertices", "edges", "only_faces"],
+            Field(description="Element type to delete in delete_elements."),
+        ] = "faces",
+        proportional_radius: Annotated[
+            float, Field(ge=0.0, description="Proportional Editing radius (>0 enables falloff).")
+        ] = 0.0,
+        proportional_falloff: Annotated[
+            Literal["smooth", "sphere", "linear", "sharp"],
+            Field(description="Proportional Editing falloff curve."),
+        ] = "smooth",
+        symmetrize_direction: Annotated[
+            Literal["-x_to_+x", "+x_to_-x", "-y_to_+y", "+y_to_-y", "-z_to_+z", "+z_to_-z"],
+            Field(description="Mirror direction for symmetrize."),
+        ] = "-x_to_+x",
+        projection: Annotated[
+            Literal["box", "planar_x", "planar_y", "planar_z", "cylindrical", "spherical"],
+            Field(description="UV projection method for project_uvs."),
+        ] = "box",
+        uv_scale: Annotated[Vec2, Field(description="UV tiling scale for project_uvs.")] = (
+            1.0,
+            1.0,
+        ),
+        flip_normals_flag: Annotated[
+            bool, Field(description="Flip winding on duplicated faces.")
+        ] = False,
+        inside: Annotated[
+            bool, Field(description="Recalculate normals pointing inward instead of outward.")
+        ] = False,
+        offset: Annotated[
+            float, Field(description="Normal offset for poke_faces or solidify_faces.")
+        ] = 0.0,
+        seed: Annotated[int, Field(description="Seed for randomize_vertices.")] = 42,
+        normal_only: Annotated[
+            bool, Field(description="Jitter vertices along normals only.")
+        ] = False,
+        target_selection_mode: Annotated[
+            Literal["top", "bottom", "front", "back", "left", "right", "indices", "bbox"] | None,
+            Field(description="Optional second face selection for bridge_edge_loops."),
+        ] = None,
+        target_indices: Annotated[
+            list[int] | None,
+            Field(description="Explicit face indices for second bridge_edge_loops target."),
+        ] = None,
+        twist: Annotated[
+            int, Field(description="Edge ring twist offset for bridge_edge_loops.")
+        ] = 0,
+        material_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Material ID/name to assign to selected faces (assign_face_material) "
+                    "or newly generated caps/extrusions."
+                )
+            ),
+        ] = None,
+        separated_name: Annotated[
+            str | None, Field(description="Name for separated object in separate_selection.")
+        ] = None,
     ) -> dict[str, Any]:
-        """Perform Blender-style Edit Mesh operations using semantic face/edge queries."""
+        """Perform Blender-style Edit Mode modeling operations using semantic or indexed queries."""
         sess = get_session()
         with sess.lock:
             obj = sess.require_object(object_id, expected_kind="mesh")
             if obj.mesh is None:
                 raise ToolError(f"Object {obj.name!r} has no editable base mesh.")
             cur = MeshData.from_payload(obj.mesh)
+
+            resolved_mat_id: str | None = None
+            if material_id is not None:
+                mat = sess.scene.resolve_material(material_id)
+                if mat is None:
+                    raise ToolError(
+                        f"Material {material_id!r} not found. "
+                        f"Available: {list(sess.scene.materials.keys())}"
+                    )
+                resolved_mat_id = mat.id
+
+            resolved_sel_mat: str | None = selection_material_id
+            if selection_material_id is not None:
+                smat = sess.scene.resolve_material(selection_material_id)
+                if smat is not None:
+                    resolved_sel_mat = smat.id
+
+            edge_pairs: list[tuple[int, int]] | None = None
+            if edge_indices is not None:
+                edge_pairs = [(int(e[0]), int(e[1])) for e in edge_indices if len(e) >= 2]
+
             query = SelectionQuery(
                 mode=selection_mode,
                 direction=direction,
@@ -477,40 +633,106 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
                 bbox_min=bbox_min,
                 bbox_max=bbox_max,
                 indices=indices,
+                vertex_indices=vertex_indices,
+                edge_indices=edge_pairs,
+                seed_face=seed_face,
+                material_id=resolved_sel_mat,
+                invert=invert,
             )
+            target_query: SelectionQuery | None = None
+            if target_selection_mode is not None or target_indices is not None:
+                target_query = SelectionQuery(
+                    mode=target_selection_mode or "indices",
+                    indices=target_indices,
+                    angle_threshold_deg=angle_threshold_deg,
+                )
+
             try:
-                if operation == "extrude_faces":
-                    res = extrude_faces(cur, query, distance=distance, scale=scale)
-                elif operation == "inset_faces":
-                    res = inset_faces(cur, query, thickness=thickness, depth=depth)
-                elif operation == "bevel_edges":
-                    res = bevel_edges(
-                        cur, angle_threshold_deg=angle_threshold_deg, width=width, segments=segments
-                    )
-                elif operation == "subdivide":
-                    res = subdivide_mesh(cur, levels=levels, smooth=smooth_subdiv)
-                elif operation == "transform_selection":
-                    res = transform_selection(
-                        cur, query, translate=translate, rotate_deg=rotate_deg
-                    )
-                elif operation == "smooth":
-                    res = smooth_laplacian(cur, iterations=iterations, factor=factor)
-                elif operation == "recompute_normals":
-                    res = recompute_normals(cur)
-                else:
-                    res = repair_manifold(cur)
+                res = run_edit_operation(
+                    cur,
+                    operation=operation,
+                    query=query,
+                    face_material_ids=obj.face_material_ids,
+                    base_material_id=obj.material_id,
+                    distance=distance,
+                    thickness=thickness,
+                    depth=depth,
+                    width=width,
+                    segments=segments,
+                    levels=levels,
+                    cuts=cuts,
+                    slide=slide,
+                    smooth_subdiv=smooth_subdiv,
+                    individual=individual,
+                    along_normals=along_normals,
+                    direction=direction,
+                    scale=scale,
+                    translate=translate,
+                    rotate_deg=rotate_deg,
+                    scale_vec=scale_vec,
+                    iterations=iterations,
+                    factor=factor,
+                    axis=axis,
+                    shear_axis=shear_axis,
+                    plane_point=plane_point,
+                    plane_normal=plane_normal,
+                    clear_inner=clear_inner,
+                    clear_outer=clear_outer,
+                    fill_caps=fill_caps,
+                    merge_mode=merge_mode,
+                    merge_distance=merge_distance,
+                    delete_mode=delete_mode,
+                    proportional_radius=proportional_radius,
+                    proportional_falloff=proportional_falloff,
+                    symmetrize_direction=symmetrize_direction,
+                    projection=projection,
+                    uv_scale=uv_scale,
+                    flip_normals_flag=flip_normals_flag,
+                    inside=inside,
+                    offset=offset,
+                    seed=seed,
+                    normal_only=normal_only,
+                    target_query=target_query,
+                    twist=twist,
+                    material_id=resolved_mat_id,
+                )
             except GeometryError as exc:
                 raise ToolError(str(exc)) from exc
 
             sess.push_history(f"mesh_edit:{obj.name}:{operation}")
-            obj.mesh = res.to_payload()
-            ev = evaluate_object_mesh(sess.scene, obj.id)
-            return {
+            obj.mesh = res.mesh.to_payload()
+            obj.face_material_ids = res.face_material_ids
+
+            out_payload: dict[str, Any] = {
                 "status": "ok",
                 "object_id": obj.id,
                 "operation": operation,
-                "stats": ev.world_mesh.stats(),
+                "face_material_override_count": len(obj.face_material_ids),
             }
+            if res.extra:
+                out_payload.update(res.extra)
+
+            if res.separated_mesh is not None:
+                sep_name = sess.scene.unique_name(separated_name or f"{obj.name}_Part")
+                sep_id = sess.scene.next_id(sep_name.lower())
+                sep_obj = SceneObject(
+                    id=sep_id,
+                    name=sep_name,
+                    kind="mesh",
+                    transform=obj.transform.model_copy(deep=True),
+                    parent_id=obj.parent_id,
+                    collection_id=obj.collection_id,
+                    material_id=obj.material_id,
+                    face_material_ids=res.separated_face_material_ids,
+                    mesh=res.separated_mesh.to_payload(),
+                )
+                sess.scene.objects[sep_id] = sep_obj
+                out_payload["separated_object_id"] = sep_id
+                out_payload["separated_object_name"] = sep_name
+
+            ev = evaluate_object_mesh(sess.scene, obj.id)
+            out_payload["stats"] = ev.world_mesh.stats()
+            return out_payload
 
     @mcp.tool(
         title="CSG Boolean Operation",
@@ -561,10 +783,10 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
                 sess.scene.objects[r_id] = new_obj
                 out_obj = new_obj
             else:
-                # Result is in world space, reset transform & modifiers on primary object
                 obj_a.kind = "mesh"
                 obj_a.node_graph = None
                 obj_a.modifiers = []
+                obj_a.face_material_ids = {}
                 obj_a.transform = Transform()
                 obj_a.mesh = world_res.to_payload()
                 out_obj = obj_a
@@ -708,20 +930,80 @@ def register_modeling_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSes
             }
 
     @mcp.tool(
-        title="Inspect Mesh Topology",
+        title="Inspect Mesh Topology & Elements",
         annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
     )
     def mesh_inspect_topology(
         object_id: Annotated[str, Field(description="Mesh or procedural object ID or name.")],
+        detail: Annotated[
+            Literal["summary", "faces", "edges", "vertices", "selection", "materials"],
+            Field(description="Level of Edit Mode element detail to inspect."),
+        ] = "summary",
+        selection_mode: Annotated[
+            Literal[
+                "all",
+                "top",
+                "bottom",
+                "front",
+                "back",
+                "left",
+                "right",
+                "normal_dir",
+                "bbox",
+                "indices",
+                "vertex_indices",
+                "edge_indices",
+                "coplanar",
+                "boundary",
+                "material",
+            ]
+            | None,
+            Field(description="Optional selection query to resolve indices for previewing edits."),
+        ] = None,
+        direction: Annotated[Vec3 | None, Field(description="Direction for normal_dir.")] = None,
+        angle_threshold_deg: Annotated[float, Field(ge=0.5, le=180.0)] = 45.0,
+        bbox_min: Annotated[Vec3 | None, Field(description="Selection box min.")] = None,
+        bbox_max: Annotated[Vec3 | None, Field(description="Selection box max.")] = None,
+        indices: Annotated[list[int] | None, Field(description="Explicit face indices.")] = None,
+        material_id: Annotated[str | None, Field(description="Material ID filter.")] = None,
+        invert: Annotated[bool, Field(description="Invert selection preview.")] = False,
+        offset: Annotated[int, Field(ge=0, description="Pagination offset.")] = 0,
+        limit: Annotated[int, Field(ge=1, le=512, description="Max items to return.")] = 64,
     ) -> dict[str, Any]:
-        """Return vertex/face/edge counts, watertight flags, volume, area, and bounds."""
+        """Inspect topology stats, Edit Mode elements, face materials, and selection previews."""
         sess = get_session()
         with sess.lock:
             obj = sess.require_mesh_like(object_id)
             ev = evaluate_object_mesh(sess.scene, obj.id)
-            return {
+            res: dict[str, Any] = {
                 "object_id": obj.id,
                 "name": obj.name,
                 "local_stats": ev.local_mesh.stats(),
                 "world_stats": ev.world_mesh.stats(),
             }
+            if detail != "summary" or selection_mode is not None:
+                query = (
+                    SelectionQuery(
+                        mode=selection_mode or "all",
+                        direction=direction,
+                        angle_threshold_deg=angle_threshold_deg,
+                        bbox_min=bbox_min,
+                        bbox_max=bbox_max,
+                        indices=indices,
+                        material_id=material_id,
+                        invert=invert,
+                    )
+                    if (selection_mode is not None or detail == "selection")
+                    else None
+                )
+                base_m = MeshData.from_payload(obj.mesh) if obj.mesh is not None else ev.local_mesh
+                res["elements"] = inspect_mesh_elements(
+                    base_m,
+                    detail=detail,
+                    query=query,
+                    face_material_ids=obj.face_material_ids,
+                    base_material_id=obj.material_id,
+                    offset=offset,
+                    limit=limit,
+                )
+            return res

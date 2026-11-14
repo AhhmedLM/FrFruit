@@ -16,6 +16,55 @@ class GeometryError(ValueError):
     """Raised when a geometry operation cannot proceed on the given mesh."""
 
 
+def safe_fix_normals(tm: trimesh.Trimesh) -> None:
+    """Ensure consistent outward triangle winding without requiring networkx."""
+    try:
+        trimesh.repair.fix_normals(tm)
+        return
+    except ModuleNotFoundError:
+        pass
+
+    faces = np.asarray(tm.faces, dtype=np.int64).copy()
+    verts = np.asarray(tm.vertices, dtype=np.float64)
+    n_f = len(faces)
+    if n_f == 0:
+        return
+
+    edge_faces: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    for fi, (a, b, c) in enumerate(faces):
+        for u, v in ((int(a), int(b)), (int(b), int(c)), (int(c), int(a))):
+            key = (min(u, v), max(u, v))
+            edge_faces.setdefault(key, []).append((fi, u, v))
+
+    visited = [False] * n_f
+    for start in range(n_f):
+        if visited[start]:
+            continue
+        comp: list[int] = []
+        queue = [start]
+        visited[start] = True
+        while queue:
+            cur = queue.pop()
+            comp.append(cur)
+            fa, fb, fc = int(faces[cur, 0]), int(faces[cur, 1]), int(faces[cur, 2])
+            for u, v in ((fa, fb), (fb, fc), (fc, fa)):
+                key = (min(u, v), max(u, v))
+                for nbr, nu, nv in edge_faces.get(key, ()):
+                    if visited[nbr]:
+                        continue
+                    if nu == u and nv == v:
+                        faces[nbr] = faces[nbr][[0, 2, 1]]
+                    visited[nbr] = True
+                    queue.append(nbr)
+        tri_pts = verts[faces[comp]]
+        signed_vol = float(
+            np.sum(np.einsum("ij,ij->i", tri_pts[:, 0], np.cross(tri_pts[:, 1], tri_pts[:, 2])))
+        )
+        if signed_vol < 0.0:
+            faces[comp] = faces[comp][:, [0, 2, 1]]
+    tm.faces = faces
+
+
 @dataclass
 class MeshData:
     """In-memory triangle mesh representation."""
@@ -110,7 +159,7 @@ class MeshData:
         # Merge nearly coincident vertices cleanly so CSG stays watertight
         tm = trimesh.Trimesh(vertices=self.vertices, faces=self.faces, process=False)
         tm.merge_vertices(digits_vertex=6)
-        trimesh.repair.fix_normals(tm)
+        safe_fix_normals(tm)
         verts = np.asarray(tm.vertices, dtype=np.float32)
         tris = np.asarray(tm.faces, dtype=np.uint32)
         m = manifold3d.Mesh(vert_properties=verts, tri_verts=tris)

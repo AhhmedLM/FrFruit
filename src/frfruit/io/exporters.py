@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import trimesh
+from PIL import Image
 from trimesh.visual import TextureVisuals
 from trimesh.visual.material import PBRMaterial
 
@@ -18,6 +19,8 @@ from frfruit.core.math3d import compose_matrix, euler_deg_to_matrix
 from frfruit.core.scene import MaterialSpec, SceneDocument
 from frfruit.geometry.mesh import MeshData, concat_meshes
 from frfruit.geometry.spatial import evaluate_object_mesh, evaluate_scene_meshes
+from frfruit.io.fbx_exporter import TargetEngine, export_fbx_scene
+from frfruit.textures.loader import compute_triplanar_uvs
 
 
 def _euler_deg_to_quat_xyzw(rx_deg: float, ry_deg: float, rz_deg: float) -> list[float]:
@@ -50,6 +53,18 @@ def _euler_deg_to_quat_xyzw(rx_deg: float, ry_deg: float, rz_deg: float) -> list
     return [float(x), float(y), float(z), float(w)]
 
 
+def _open_pil(path_str: str | None) -> Image.Image | None:
+    if not path_str:
+        return None
+    p = Path(path_str)
+    if not p.is_file():
+        return None
+    try:
+        return Image.open(p).convert("RGB")
+    except Exception:
+        return None
+
+
 def _material_to_pbr(mat: MaterialSpec | None) -> PBRMaterial:
     if mat is None:
         return PBRMaterial(
@@ -68,19 +83,48 @@ def _material_to_pbr(mat: MaterialSpec | None) -> PBRMaterial:
         if mat.emission_strength > 0
         else [0.0, 0.0, 0.0]
     )
-    return PBRMaterial(
-        name=mat.name,
-        baseColorFactor=[
+    base_tex = _open_pil(mat.albedo_map)
+    nrm_tex = _open_pil(mat.normal_map)
+    rgh_tex = _open_pil(mat.roughness_map)
+    mtl_tex = _open_pil(mat.metallic_map)
+    mr_tex: Image.Image | None = None
+    if rgh_tex is not None or mtl_tex is not None:
+        ref = rgh_tex or mtl_tex
+        assert ref is not None
+        size = ref.size
+        r_arr = np.zeros((size[1], size[0]), dtype=np.uint8)
+        g_arr = (
+            np.asarray(rgh_tex.resize(size).convert("L"), dtype=np.uint8)
+            if rgh_tex is not None
+            else np.full((size[1], size[0]), int(mat.roughness * 255), dtype=np.uint8)
+        )
+        b_arr = (
+            np.asarray(mtl_tex.resize(size).convert("L"), dtype=np.uint8)
+            if mtl_tex is not None
+            else np.full((size[1], size[0]), int(mat.metallic * 255), dtype=np.uint8)
+        )
+        mr_tex = Image.fromarray(np.stack([r_arr, g_arr, b_arr], axis=-1), mode="RGB")
+
+    kwargs: dict[str, Any] = {
+        "name": mat.name,
+        "baseColorFactor": [
             float(mat.base_color[0]),
             float(mat.base_color[1]),
             float(mat.base_color[2]),
             float(mat.alpha * mat.base_color[3]),
         ],
-        metallicFactor=float(mat.metallic),
-        roughnessFactor=float(mat.roughness),
-        emissiveFactor=emissive,
-        alphaMode=alpha_mode,
-    )
+        "metallicFactor": 1.0 if mtl_tex is not None else float(mat.metallic),
+        "roughnessFactor": 1.0 if rgh_tex is not None else float(mat.roughness),
+        "emissiveFactor": emissive,
+        "alphaMode": alpha_mode,
+    }
+    if base_tex is not None:
+        kwargs["baseColorTexture"] = base_tex
+    if nrm_tex is not None:
+        kwargs["normalTexture"] = nrm_tex
+    if mr_tex is not None:
+        kwargs["metallicRoughnessTexture"] = mr_tex
+    return PBRMaterial(**kwargs)
 
 
 def _build_trimesh_scene(scene: SceneDocument, yup: bool = True) -> trimesh.Scene:
@@ -97,15 +141,12 @@ def _build_trimesh_scene(scene: SceneDocument, yup: bool = True) -> trimesh.Scen
         ev = evaluate_object_mesh(scene, oid)
         if ev.local_mesh.is_empty:
             continue
-        tm = ev.local_mesh.to_trimesh(process=False)
-        mat = scene.materials.get(obj.material_id) if obj.material_id else None
-        pbr = _material_to_pbr(mat)
         uvs = (
             ev.local_mesh.uvs
-            if ev.local_mesh.uvs is not None and len(ev.local_mesh.uvs) == len(tm.vertices)
+            if ev.local_mesh.uvs is not None
+            and len(ev.local_mesh.uvs) == len(ev.local_mesh.vertices)
             else None
         )
-        tm.visual = TextureVisuals(uv=uvs, material=pbr)
         local_mat = compose_matrix(
             location=obj.transform.location,
             rotation_deg=obj.transform.rotation_deg,
@@ -116,13 +157,67 @@ def _build_trimesh_scene(scene: SceneDocument, yup: bool = True) -> trimesh.Scen
             if (obj.parent_id and obj.parent_id in scene.objects)
             else (root_name if yup else "world")
         )
-        tm_scene.add_geometry(
-            tm,
-            node_name=oid,
-            geom_name=f"{oid}_geom",
-            parent_node_name=parent_frame,
-            transform=local_mat,
-        )
+
+        # Group faces by effective material ID
+        n_faces = len(ev.local_mesh.faces)
+        face_groups: dict[str | None, list[int]] = {}
+        if obj.face_material_ids:
+            for fi in range(n_faces):
+                mid = obj.face_material_ids.get(fi, obj.material_id)
+                if mid not in scene.materials:
+                    mid = obj.material_id if (obj.material_id in scene.materials) else None
+                face_groups.setdefault(mid, []).append(fi)
+        else:
+            eff = obj.material_id if (obj.material_id in scene.materials) else None
+            face_groups[eff] = list(range(n_faces))
+
+        if len(face_groups) <= 1:
+            mid = next(iter(face_groups.keys()))
+            mat = scene.materials.get(mid) if mid else None
+            pbr = _material_to_pbr(mat)
+            if (
+                uvs is None
+                and mat
+                and any((mat.albedo_map, mat.normal_map, mat.roughness_map, mat.metallic_map))
+            ):
+                uvs = compute_triplanar_uvs(ev.local_mesh.vertices, ev.local_mesh.vertex_normals())
+            tm = ev.local_mesh.to_trimesh(process=False)
+            tm.visual = TextureVisuals(uv=uvs, material=pbr)
+            tm_scene.add_geometry(
+                tm,
+                node_name=oid,
+                geom_name=f"{oid}_geom",
+                parent_node_name=parent_frame,
+                transform=local_mat,
+            )
+        else:
+            tm_scene.graph.update(frame_from=parent_frame, frame_to=oid, matrix=local_mat)
+            base_norms = ev.local_mesh.vertex_normals()
+            for slot_idx, (mid, f_idxs) in enumerate(face_groups.items()):
+                mat = scene.materials.get(mid) if mid else None
+                pbr = _material_to_pbr(mat)
+                eff_uvs = uvs
+                if (
+                    eff_uvs is None
+                    and mat
+                    and any((mat.albedo_map, mat.normal_map, mat.roughness_map, mat.metallic_map))
+                ):
+                    eff_uvs = compute_triplanar_uvs(ev.local_mesh.vertices, base_norms)
+                sub_faces_orig = ev.local_mesh.faces[f_idxs]
+                uniq_v, inv = np.unique(sub_faces_orig.reshape(-1), return_inverse=True)
+                sub_tm = trimesh.Trimesh(
+                    vertices=ev.local_mesh.vertices[uniq_v],
+                    faces=inv.reshape(-1, 3),
+                    process=False,
+                )
+                sub_uvs = eff_uvs[uniq_v] if eff_uvs is not None else None
+                sub_tm.visual = TextureVisuals(uv=sub_uvs, material=pbr)
+                tm_scene.add_geometry(
+                    sub_tm,
+                    node_name=f"{oid}_mat{slot_idx}",
+                    geom_name=f"{oid}_geom_{slot_idx}",
+                    parent_node_name=oid,
+                )
     return tm_scene
 
 
@@ -324,14 +419,42 @@ def export_blender_python(scene: SceneDocument) -> str:
             [
                 f"m = bpy.data.materials.new(name={mat.name!r})",
                 "m.use_nodes = True",
-                "bsdf = m.node_tree.nodes.get('Principled BSDF')",
+                "nt = m.node_tree",
+                "bsdf = nt.nodes.get('Principled BSDF')",
                 "if bsdf:",
                 f"    bsdf.inputs['Base Color'].default_value = {list(mat.base_color)!r}",
                 f"    bsdf.inputs['Metallic'].default_value = {mat.metallic}",
                 f"    bsdf.inputs['Roughness'].default_value = {mat.roughness}",
-                f"materials[{mid!r}] = m",
             ]
         )
+        for slot_path, socket_name, is_noncolor in (
+            (mat.albedo_map, "Base Color", False),
+            (mat.roughness_map, "Roughness", True),
+            (mat.metallic_map, "Metallic", True),
+        ):
+            if slot_path and Path(slot_path).is_file():
+                s_rep = repr(str(slot_path))
+                lines.extend(
+                    [
+                        "    tex = nt.nodes.new('ShaderNodeTexImage')",
+                        f"    tex.image = bpy.data.images.load({s_rep}, check_existing=True)",
+                        f"    if {is_noncolor!r}: tex.image.colorspace_settings.name = 'Non-Color'",
+                        f"    nt.links.new(tex.outputs['Color'], bsdf.inputs[{socket_name!r}])",
+                    ]
+                )
+        if mat.normal_map and Path(mat.normal_map).is_file():
+            n_rep = repr(str(mat.normal_map))
+            lines.extend(
+                [
+                    "    tex_n = nt.nodes.new('ShaderNodeTexImage')",
+                    f"    tex_n.image = bpy.data.images.load({n_rep}, check_existing=True)",
+                    "    tex_n.image.colorspace_settings.name = 'Non-Color'",
+                    "    nmap = nt.nodes.new('ShaderNodeNormalMap')",
+                    "    nt.links.new(tex_n.outputs['Color'], nmap.inputs['Color'])",
+                    "    nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])",
+                ]
+            )
+        lines.append(f"materials[{mid!r}] = m")
 
     lines.append("")
     for _oid, ev in evaluated.items():
@@ -354,8 +477,25 @@ def export_blender_python(scene: SceneDocument) -> str:
                 f"obj.scale = {scale!r}",
             ]
         )
+        slot_mids: list[str] = []
+        slot_of_mid: dict[str, int] = {}
         if ev.obj.material_id and ev.obj.material_id in scene.materials:
-            lines.append(f"obj.data.materials.append(materials[{ev.obj.material_id!r}])")
+            slot_of_mid[ev.obj.material_id] = 0
+            slot_mids.append(ev.obj.material_id)
+        for _fi, mid in sorted(ev.obj.face_material_ids.items()):
+            if mid in scene.materials and mid not in slot_of_mid:
+                slot_of_mid[mid] = len(slot_mids)
+                slot_mids.append(mid)
+        for mid in slot_mids:
+            lines.append(f"obj.data.materials.append(materials[{mid!r}])")
+        face_slot_map = {
+            int(fi): slot_of_mid[mid]
+            for fi, mid in sorted(ev.obj.face_material_ids.items())
+            if mid in slot_of_mid and 0 <= int(fi) < len(faces)
+        }
+        if face_slot_map:
+            lines.append(f"for _fi, _si in {face_slot_map!r}.items():")
+            lines.append("    mesh_data.polygons[_fi].material_index = _si")
         lines.append("")
 
     for oid, obj in scene.objects.items():
@@ -386,15 +526,105 @@ def export_blender_python(scene: SceneDocument) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _export_obj_with_mtl(scene: SceneDocument, out_obj: Path) -> None:
+    evaluated = evaluate_scene_meshes(scene)
+    mtl_path = out_obj.with_suffix(".mtl")
+    obj_lines: list[str] = [f"# FrFruit OBJ Export ({scene.name})", f"mtllib {mtl_path.name}"]
+    mtl_lines: list[str] = [f"# FrFruit MTL ({scene.name})"]
+
+    used_mats: dict[str, MaterialSpec] = {}
+    for _oid, ev in evaluated.items():
+        if ev.obj.material_id and ev.obj.material_id in scene.materials:
+            used_mats[ev.obj.material_id] = scene.materials[ev.obj.material_id]
+        for mid in ev.obj.face_material_ids.values():
+            if mid in scene.materials:
+                used_mats[mid] = scene.materials[mid]
+
+    safe_mtl_names: dict[str, str] = {}
+    for mid, m in used_mats.items():
+        sname = f"{m.name}_{mid}".replace(" ", "_")
+        safe_mtl_names[mid] = sname
+        r, g, b, _ = m.base_color
+        er, eg, eb, _ = m.emission_color
+        ks = max(0.04, m.metallic)
+        ke_r = er * m.emission_strength
+        ke_g = eg * m.emission_strength
+        ke_b = eb * m.emission_strength
+        mtl_lines.extend(
+            [
+                f"newmtl {sname}",
+                f"Kd {r:.5f} {g:.5f} {b:.5f}",
+                f"Ks {ks:.5f} {ks:.5f} {ks:.5f}",
+                f"Ns {max(2.0, (1.0 - m.roughness) ** 2 * 250.0):.2f}",
+                f"Ke {ke_r:.5f} {ke_g:.5f} {ke_b:.5f}",
+                f"d {m.alpha:.4f}",
+                "",
+            ]
+        )
+    if used_mats:
+        mtl_path.write_text("\n".join(mtl_lines), encoding="utf-8")
+
+    v_offset = 1
+    vt_offset = 1
+    vn_offset = 1
+    for _oid, ev in evaluated.items():
+        wm = ev.world_mesh
+        if wm.is_empty:
+            continue
+        obj_lines.append(f"o {ev.obj.name.replace(' ', '_')}")
+        verts = wm.vertices
+        norms = wm.vertex_normals()
+        uvs = (
+            wm.uvs
+            if wm.uvs is not None and len(wm.uvs) == len(verts)
+            else compute_triplanar_uvs(verts, norms)
+        )
+        for v in verts:
+            obj_lines.append(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
+        for uv in uvs:
+            obj_lines.append(f"vt {uv[0]:.5f} {uv[1]:.5f}")
+        for vn in norms:
+            obj_lines.append(f"vn {vn[0]:.5f} {vn[1]:.5f} {vn[2]:.5f}")
+
+        cur_mat: str | None = "__unset__"
+        for fi, (a, b, c) in enumerate(wm.faces):
+            f_mid = ev.obj.face_material_ids.get(fi, ev.obj.material_id)
+            sname = safe_mtl_names.get(f_mid) if f_mid else None
+            if sname != cur_mat:
+                cur_mat = sname
+                if sname:
+                    obj_lines.append(f"usemtl {sname}")
+            ia, ib, ic = int(a), int(b), int(c)
+            obj_lines.append(
+                f"f {ia + v_offset}/{ia + vt_offset}/{ia + vn_offset} "
+                f"{ib + v_offset}/{ib + vt_offset}/{ib + vn_offset} "
+                f"{ic + v_offset}/{ic + vt_offset}/{ic + vn_offset}"
+            )
+        v_offset += len(verts)
+        vt_offset += len(verts)
+        vn_offset += len(verts)
+
+    out_obj.write_text("\n".join(obj_lines) + "\n", encoding="utf-8")
+
+
 def export_scene_file(
     scene: SceneDocument,
     out_path: str | Path,
     fmt: str | None = None,
+    target_engine: TargetEngine = "generic",
 ) -> dict[str, object]:
-    """Export SceneDocument to glb, gltf, obj, stl, ply, or Blender .py."""
+    """Export SceneDocument to fbx, fbx_ascii, glb, gltf, obj, stl, ply, or Blender .py."""
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     ext = (fmt or p.suffix.lstrip(".")).lower()
+
+    if ext in ("fbx", "fbx_ascii"):
+        return export_fbx_scene(
+            scene,
+            p,
+            ascii_mode=(ext == "fbx_ascii"),
+            target_engine=target_engine,
+        )
 
     if ext in ("glb", "gltf"):
         tm_scene = _build_trimesh_scene(scene, yup=True)
@@ -417,7 +647,11 @@ def export_scene_file(
                 p.write_text(str(exported), encoding="utf-8")
         return {"path": str(p), "format": ext, "bytes": p.stat().st_size}
 
-    if ext in ("obj", "stl", "ply"):
+    if ext == "obj":
+        _export_obj_with_mtl(scene, p)
+        return {"path": str(p), "format": ext, "bytes": p.stat().st_size}
+
+    if ext in ("stl", "ply"):
         evaluated = evaluate_scene_meshes(scene)
         merged = concat_meshes(
             [ev.world_mesh for ev in evaluated.values() if not ev.world_mesh.is_empty]
@@ -437,4 +671,6 @@ def export_scene_file(
         p.write_text(script, encoding="utf-8")
         return {"path": str(p), "format": "blender_py", "bytes": p.stat().st_size}
 
-    raise ValueError(f"Unsupported export format {ext!r}. Use glb, gltf, obj, stl, ply, or py.")
+    raise ValueError(
+        f"Unsupported export format {ext!r}. Use fbx, fbx_ascii, glb, gltf, obj, stl, ply, or py."
+    )

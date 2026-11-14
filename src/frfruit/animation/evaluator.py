@@ -49,6 +49,21 @@ def apply_animation_frame(scene: SceneDocument, frame: int) -> SceneDocument:
                 elif parts[0] == "scale":
                     v_safe = val if abs(val) > 1e-6 else 1e-6
                     obj.transform.scale = _set_tuple_axis(obj.transform.scale, idx, v_safe)  # type: ignore[assignment]
+            elif (
+                obj.armature is not None
+                and len(parts) == 4
+                and parts[0] == "bone"
+                and parts[2] in ("rotation_deg", "translation")
+                and parts[3] in _AXIS_IDX
+            ):
+                bname, prop, ax = parts[1], parts[2], _AXIS_IDX[parts[3]]
+                for bone in obj.armature.bones:
+                    if bone.name == bname:
+                        if prop == "rotation_deg":
+                            bone.rotation_deg = _set_tuple_axis(bone.rotation_deg, ax, val)  # type: ignore[assignment]
+                        else:
+                            bone.translation = _set_tuple_axis(bone.translation, ax, val)  # type: ignore[assignment]
+                        break
             elif obj.camera is not None:
                 if len(parts) == 2 and parts[0] == "target" and parts[1] in _AXIS_IDX:
                     obj.camera.target = _set_tuple_axis(obj.camera.target, _AXIS_IDX[parts[1]], val)  # type: ignore[assignment]

@@ -108,20 +108,30 @@ class SelectionQuery(BaseModel):
         "normal_dir",
         "bbox",
         "indices",
+        "vertex_indices",
+        "edge_indices",
+        "coplanar",
+        "boundary",
+        "material",
     ] = "all"
     direction: Vec3 | None = Field(
         default=None,
-        description="Target unit normal direction when mode='normal_dir'.",
+        description="Target unit normal direction when mode='normal_dir' or 'coplanar'.",
     )
     angle_threshold_deg: float = Field(
         default=45.0,
-        ge=1.0,
+        ge=0.5,
         le=180.0,
-        description="Maximum angle deviation in degrees for directional face selection.",
+        description="Maximum angle deviation in degrees for directional/coplanar selection.",
     )
     bbox_min: Vec3 | None = None
     bbox_max: Vec3 | None = None
     indices: list[int] | None = None
+    vertex_indices: list[int] | None = None
+    edge_indices: list[tuple[int, int]] | None = None
+    seed_face: int | None = None
+    material_id: str | None = None
+    invert: bool = False
 
 
 class MeshPayload(BaseModel):

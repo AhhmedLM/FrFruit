@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 from frfruit.animation.timeline import TimelineState
-from frfruit.core.types import ColorRGB, ColorRGBA, MeshPayload, Transform, Vec3
+from frfruit.core.types import ColorRGB, ColorRGBA, MeshPayload, Transform, Vec2, Vec3
 from frfruit.procedural.schema import ProceduralGraph
 
 # --- Modifiers (Discriminated Union) ---
@@ -130,7 +130,7 @@ ModifierSpec = Annotated[
 
 
 class MaterialSpec(BaseModel):
-    """PBR + optional procedural material definition."""
+    """PBR + optional procedural + bitmap texture-mapped material definition."""
 
     id: str
     name: str
@@ -144,6 +144,15 @@ class MaterialSpec(BaseModel):
     pattern: Literal["solid", "checker", "gradient", "wood", "noise"] = "solid"
     secondary_color: ColorRGBA = (0.2, 0.2, 0.25, 1.0)
     pattern_scale: float = Field(default=4.0, gt=0.0)
+    # Downloaded or local bitmap PBR texture channels
+    albedo_map: str | None = None
+    normal_map: str | None = None
+    roughness_map: str | None = None
+    metallic_map: str | None = None
+    ao_map: str | None = None
+    height_map: str | None = None
+    uv_scale: Vec2 = (1.0, 1.0)
+    texture_source: str | None = None
 
 
 class LightSpec(BaseModel):
@@ -179,6 +188,85 @@ class WorldEnvironment(BaseModel):
     ambient_strength: float = Field(default=0.32, ge=0.0, le=2.0)
 
 
+class PostProcessConfig(BaseModel):
+    """Post-processing compositing stack applied to PBR and path-traced renders."""
+
+    enabled: bool = True
+    tone_mapper: Literal["aces", "filmic", "reinhard", "none"] = "aces"
+    exposure: float = Field(default=0.0, ge=-5.0, le=5.0)
+    bloom_enabled: bool = True
+    bloom_threshold: float = Field(default=0.92, ge=0.1, le=10.0)
+    bloom_intensity: float = Field(default=0.22, ge=0.0, le=3.0)
+    bloom_radius: float = Field(default=5.0, ge=0.5, le=24.0)
+    ssao_enabled: bool = True
+    ssao_radius: float = Field(default=3.5, ge=0.5, le=20.0)
+    ssao_strength: float = Field(default=0.30, ge=0.0, le=1.5)
+    dof_enabled: bool = False
+    dof_focus_distance: float = Field(default=6.0, gt=0.05)
+    dof_aperture: float = Field(default=0.35, ge=0.0, le=2.0)
+    vignette_intensity: float = Field(default=0.12, ge=0.0, le=1.0)
+    vignette_softness: float = Field(default=0.72, ge=0.1, le=2.0)
+    chromatic_aberration: float = Field(default=0.0, ge=0.0, le=5.0)
+    saturation: float = Field(default=1.02, ge=0.0, le=2.5)
+    contrast: float = Field(default=1.02, ge=0.2, le=2.5)
+    temperature: float = Field(default=0.0, ge=-1.0, le=1.0)
+    fxaa_enabled: bool = True
+    sharpen: float = Field(default=0.08, ge=0.0, le=1.0)
+
+
+class RigidBodySpec(BaseModel):
+    """Rigid-body physics simulation configuration."""
+
+    enabled: bool = True
+    body_type: Literal["dynamic", "static", "kinematic"] = "dynamic"
+    mass: float = Field(default=1.0, gt=0.0)
+    restitution: float = Field(default=0.45, ge=0.0, le=1.0)
+    friction: float = Field(default=0.55, ge=0.0, le=1.5)
+    linear_damping: float = Field(default=0.04, ge=0.0, le=1.0)
+    angular_damping: float = Field(default=0.08, ge=0.0, le=1.0)
+    initial_velocity: Vec3 = (0.0, 0.0, 0.0)
+    collider_shape: Literal["box", "sphere", "mesh_aabb"] = "box"
+
+
+class ClothSpec(BaseModel):
+    """XPBD Cloth / Soft-body physics simulation settings."""
+
+    enabled: bool = True
+    stiffness: float = Field(default=0.92, ge=0.05, le=1.0)
+    bend_stiffness: float = Field(default=0.25, ge=0.0, le=1.0)
+    damping: float = Field(default=0.03, ge=0.0, le=0.5)
+    mass_per_vertex: float = Field(default=0.05, gt=0.0)
+    wind: Vec3 = (0.0, 0.0, 0.0)
+    pin_mode: Literal["none", "top_corners", "top_edge", "border", "indices"] = "top_corners"
+    pinned_indices: list[int] = Field(default_factory=list)
+    collision_margin: float = Field(default=0.03, ge=0.001, le=0.5)
+    substeps: int = Field(default=8, ge=1, le=32)
+
+
+class BoneSpec(BaseModel):
+    """Single skeletal bone inside an Armature hierarchy."""
+
+    name: str
+    parent: str | None = None
+    head: Vec3 = (0.0, 0.0, 0.0)
+    tail: Vec3 = (0.0, 0.0, 0.5)
+    translation: Vec3 = (0.0, 0.0, 0.0)
+    rotation_deg: Vec3 = (0.0, 0.0, 0.0)
+
+
+class ArmatureSpec(BaseModel):
+    """Skeletal rig hierarchy for game-ready character and mechanical animation."""
+
+    bones: list[BoneSpec] = Field(default_factory=list)
+
+
+class SkinWeightSpec(BaseModel):
+    """Vertex skin weights binding a mesh object to an armature."""
+
+    armature_id: str
+    weights: dict[str, list[tuple[int, float]]] = Field(default_factory=dict)
+
+
 class CollectionSpec(BaseModel):
     """Logical grouping of SceneObjects (Blender Collection equivalent)."""
 
@@ -189,11 +277,11 @@ class CollectionSpec(BaseModel):
 
 
 class SceneObject(BaseModel):
-    """Any object in the 3D scene tree (mesh, procedural, light, camera, empty)."""
+    """Any object in the 3D scene tree (mesh, procedural, light, camera, armature, empty)."""
 
     id: str
     name: str
-    kind: Literal["mesh", "procedural", "light", "camera", "empty"] = "mesh"
+    kind: Literal["mesh", "procedural", "light", "camera", "armature", "empty"] = "mesh"
     transform: Transform = Field(default_factory=Transform)
     parent_id: str | None = None
     collection_id: str = "default"
@@ -206,17 +294,24 @@ class SceneObject(BaseModel):
     node_graph: ProceduralGraph | None = None
     light: LightSpec | None = None
     camera: CameraSpec | None = None
+    rigid_body: RigidBodySpec | None = None
+    cloth: ClothSpec | None = None
+    armature: ArmatureSpec | None = None
+    skin: SkinWeightSpec | None = None
+    vertex_cache: dict[int, list[list[float]]] = Field(default_factory=dict)
 
 
 class SceneDocument(BaseModel):
     """Top-level serializable FrFruit 3D project document (.frf.json)."""
 
-    schema_version: str = "1.0"
+    schema_version: str = "1.1"
     name: str = "UntitledScene"
     up_axis: Literal["Z", "Y"] = "Z"
     unit_system: Literal["meters", "centimeters", "millimeters"] = "meters"
     active_camera_id: str | None = None
+    render_engine: Literal["software", "raytrace"] = "software"
     world: WorldEnvironment = Field(default_factory=WorldEnvironment)
+    post_process: PostProcessConfig = Field(default_factory=PostProcessConfig)
     collections: dict[str, CollectionSpec] = Field(default_factory=dict)
     materials: dict[str, MaterialSpec] = Field(default_factory=dict)
     objects: dict[str, SceneObject] = Field(default_factory=dict)

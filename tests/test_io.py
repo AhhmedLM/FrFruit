@@ -148,3 +148,36 @@ def test_import_mesh_into_new_scene(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError):
         import_mesh_file(fresh, tmp_path / "nope.glb")
+
+
+def test_single_face_material_exports_glb_obj_blender_py(tmp_path: Path) -> None:
+    doc = SceneDocument.new_default("MultiMat")
+    doc.materials["mat_clay"] = MaterialSpec(id="mat_clay", **PRESET_MATERIALS["clay"])
+    doc.materials["mat_gold"] = MaterialSpec(id="mat_gold", **PRESET_MATERIALS["gold"])
+    doc.objects["cube"] = SceneObject(
+        id="cube",
+        name="SingleFaceCube",
+        kind="mesh",
+        material_id="mat_clay",
+        face_material_ids={0: "mat_gold"},
+        mesh=make_cube(1.0, origin="center").to_payload(),
+    )
+
+    glb_path = tmp_path / "multimat.glb"
+    export_scene_file(doc, glb_path)
+    loaded = trimesh.load(str(glb_path))
+    assert isinstance(loaded, trimesh.Scene)
+    assert len(loaded.geometry) == 2
+
+    obj_path = tmp_path / "multimat.obj"
+    export_scene_file(doc, obj_path)
+    obj_txt = obj_path.read_text(encoding="utf-8")
+    assert "mtllib multimat.mtl" in obj_txt
+    assert obj_txt.count("usemtl ") >= 2
+    assert (tmp_path / "multimat.mtl").is_file()
+
+    py_txt = export_blender_python(doc)
+    ast.parse(py_txt)
+    assert "obj.data.materials.append(materials['mat_clay'])" in py_txt
+    assert "obj.data.materials.append(materials['mat_gold'])" in py_txt
+    assert "mesh_data.polygons[_fi].material_index = _si" in py_txt

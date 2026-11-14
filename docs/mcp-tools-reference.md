@@ -1,6 +1,6 @@
 # FrFruit MCP Tools, Resources & Prompts Reference
 
-FrFruit exposes **29 MCP tools**, **4 static resources + 1 resource template**, and **3 guided workflow prompts** using the official `mcp` Python SDK (`MCPServer`). All modeling, spatial, procedural, animation, rendering, and I/O operations run deterministically and headlessly.
+FrFruit exposes **34 MCP tools**, **6 static resources + 1 resource template**, and **3 guided workflow prompts** using the official `mcp` Python SDK (`MCPServer`). All modeling, spatial, procedural, physics, rigging, path-traced rendering, video, and FBX/GLB export operations run deterministically and headlessly — or co-hosted live with **FrFruit Studio**.
 
 ---
 
@@ -10,8 +10,8 @@ FrFruit exposes **29 MCP tools**, **4 static resources + 1 resource template**, 
 2. [3D Modeling, Curves, Edit Mesh, CSG & Modifiers (9 Tools)](#2-3d-modeling-curves-edit-mesh-csg--modifiers-9-tools)
 3. [Procedural Node Graphs — Geometry Nodes for AI (3 Tools + 18 Nodes)](#3-procedural-node-graphs--geometry-nodes-for-ai-3-tools--18-nodes)
 4. [Spatial Reasoning, Collision & Smart Placement (2 Tools)](#4-spatial-reasoning-collision--smart-placement-2-tools)
-5. [Materials, Lights, Cameras, Rendering & Export (6 Tools)](#5-materials-lights-cameras-rendering--export-6-tools)
-6. [Keyframe Animation & Turntable Rendering (3 Tools)](#6-keyframe-animation--turntable-rendering-3-tools)
+5. [Materials, Textures, Lighting, Rendering, Post-FX & Export (8 Tools)](#5-materials-textures-lighting-rendering-post-fx--export-8-tools)
+6. [Keyframe Animation, Physics/Cloth, Skeletal Rigging & Video (6 Tools)](#6-keyframe-animation-physicscloth-skeletal-rigging--video-6-tools)
 7. [MCP Resources & Prompts](#7-mcp-resources--prompts)
 
 ---
@@ -20,9 +20,9 @@ FrFruit exposes **29 MCP tools**, **4 static resources + 1 resource template**, 
 
 | Tool | Purpose | Key Arguments |
 | --- | --- | --- |
-| `scene_new` | Reset workspace to a clean default scene with camera and 3-point/key-fill studio lights. | `name="FrFruitScene"`, `clear_history=True` |
+| `scene_new` | Reset workspace to a clean default scene with camera and studio lights. | `name="FrFruitScene"`, `clear_history=True` |
 | `scene_open` | Load a `.frf.json` project file inside the workspace sandbox. | `path` |
-| `scene_save` | Save the complete `SceneDocument` (meshes, modifiers, node graphs, timeline) as `.frf.json`. | `path="scene.frf.json"` |
+| `scene_save` | Save the complete `SceneDocument` (meshes, rigs, physics caches, post-FX, timeline) as `.frf.json`. | `path="scene.frf.json"` |
 | `scene_inspect` | Inspect scene hierarchy, evaluated world bounds, triangle counts, or a single object's details. | `detail="summary"\|"full"`, `object_id=None` |
 | `scene_undo_redo` | Step backward/forward through mutation history or manage named snapshots. | `action` (`undo` \| `redo` \| `create_snapshot` \| `restore_snapshot` \| `list_snapshots`), `snapshot_name=None` |
 | `collection_manage` | Organize objects into Blender-style collections and toggle visibility. | `action` (`create` \| `assign` \| `set_visibility` \| `delete` \| `list`), `collection_id`, `object_ids`, `visible` |
@@ -49,9 +49,13 @@ Set absolute `location`/`rotation_deg`/`scale` or apply `translate_delta`/`rotat
 Import `.glb`, `.gltf`, `.obj`, `.stl`, or `.ply` files from inside the workspace (`path`, `name_prefix`, `collection_id`).
 
 ### `mesh_edit`
-Semantic Blender-style Edit Mesh operations without requiring raw vertex index guessing:
-- **Operations**: `extrude_faces`, `inset_faces`, `bevel_edges`, `subdivide`, `transform_selection`, `smooth`, `recompute_normals`, `repair_manifold`.
-- **Semantic selection (`selection_mode`)**: `all`, `top`, `bottom`, `front`, `back`, `left`, `right`, `normal_dir` (with `direction`), `bbox` (with `bbox_min`/`bbox_max`), or `indices`.
+Full Blender-style Edit Mode modeling suite (`36` operations) with semantic or explicit element selection and automatic per-face material slot preservation:
+- **Extrude**: `extrude_faces`, `extrude_individual`, `extrude_along_normals`, `extrude_manifold`, `extrude_edges`, `extrude_vertices`.
+- **Inset & Bevel**: `inset_faces` (`individual=True/False`), `bevel_edges` (angle threshold or targeted edges), `bevel_vertices`.
+- **Cut, Subdivide & Shell**: `subdivide` (whole mesh or selected-faces conformal split), `loop_cut` (`axis`, `cuts`, `slide`, or custom `direction`), `bisect_plane` (`clear_inner`, `clear_outer`, `fill_caps`), `poke_faces`, `bridge_edge_loops`, `fill_holes`, `solidify_faces`, `wireframe_edges`.
+- **Topology & Components**: `merge_vertices` (`by_distance`, `at_center`), `delete_elements` (`faces`, `vertices`, `edges`, `only_faces`), `dissolve_faces`, `duplicate_faces`, `split_selection`, `separate_selection` (creates new `SceneObject`).
+- **Deform, Normals, UVs & Face Materials**: `transform_selection` (with Proportional Editing `proportional_radius` & `proportional_falloff`), `shrink_fatten`, `to_sphere`, `shear`, `symmetrize`, `randomize_vertices`, `smooth`, `flip_normals`, `recompute_normals`, `repair_manifold`, `project_uvs` (`box`, `planar_x/y/z`, `cylindrical`, `spherical`), `assign_face_material`, `clear_face_materials`.
+- **Selection (`selection_mode`)**: `all`, `top`, `bottom`, `front`, `back`, `left`, `right`, `normal_dir`, `bbox`, `indices`, `vertex_indices`, `edge_indices`, `coplanar` (with `seed_face`), `boundary`, `material` (with `selection_material_id`), plus `invert=True`.
 
 ### `mesh_boolean`
 Execute exact watertight CSG (`operation="union" | "difference" | "intersection"`) in world space via `manifold3d` (`object_id`, `target_object_id`, `keep_target=False`, `result_name=None`).
@@ -62,7 +66,7 @@ Manage non-destructive modifier stacks evaluated dynamically on top of base mesh
 - `modifier_manage` supports `list`, `toggle`, `remove`, `reorder`, and `apply_all`.
 
 ### `mesh_inspect_topology`
-Return local and world-space vertex/face/edge counts, `is_watertight`, `is_winding_consistent`, signed `volume`, `surface_area`, and bounding box extents.
+Inspect local/world topology (`vertex_count`, `face_count`, `edge_count`, `is_watertight`, `is_winding_consistent`, signed `volume`, `surface_area`, bounding box extents), plus paginated Edit Mode details via `detail="summary" | "faces" | "edges" | "vertices" | "selection" | "materials"` (`offset`, `limit`, and optional selection preview params).
 
 ---
 
@@ -72,25 +76,6 @@ Return local and world-space vertex/face/edge counts, `is_watertight`, `is_windi
 - `node_catalog_list(category=None)`: Query schemas, sockets, and defaults dynamically (`generator`, `points`, `transform`, `combine`, `csg`, `mesh`, `deform`, `scatter`, `output`).
 - `node_graph_set(object_id_or_name, nodes, links, seed=42, ...)`: Define a full DAG (`ProceduralGraph`) terminating in `GroupOutput`.
 - `node_graph_patch(object_id, upsert_nodes=..., remove_node_ids=..., add_links=..., remove_links=..., seed=...)`: Incrementally tweak parameters or topology without resending the whole graph.
-
-### Example `node_graph_set` Payload
-```json
-{
-  "object_id_or_name": "GoldDrops",
-  "seed": 7,
-  "nodes": [
-    {"id": "ring", "type": "CurveCircle", "params": {"radius": 1.12, "segments": 10}},
-    {"id": "drop", "type": "PrimitiveSphere", "params": {"radius": 0.085, "segments": 16}},
-    {"id": "inst", "type": "InstanceOnPoints", "params": {"scale": 1.0}},
-    {"id": "out", "type": "GroupOutput", "params": {}}
-  ],
-  "links": [
-    {"from_node": "ring", "from_socket": "geometry", "to_node": "inst", "to_socket": "points"},
-    {"from_node": "drop", "from_socket": "geometry", "to_node": "inst", "to_socket": "instance"},
-    {"from_node": "inst", "from_socket": "geometry", "to_node": "out", "to_socket": "geometry"}
-  ]
-}
-```
 
 ### Supported Node Types (18)
 | Category | Node Types |
@@ -126,45 +111,71 @@ Deterministic placement (`action`):
 
 ---
 
-## 5. Materials, Lights, Cameras, Rendering & Export (6 Tools)
+## 5. Materials, Textures, Lighting, Rendering, Post-FX & Export (8 Tools)
 
 ### `material_create_or_assign`
-Actions: `create`, `assign`, `create_and_assign`, `list_presets`. Supports linear PBR properties (`base_color`, `secondary_color`, `metallic`, `roughness`, `emission_color`, `emission_strength`, `alpha`) and procedural surface patterns (`solid`, `checker`, `gradient`, `wood`, `noise`).
+Actions: `create`, `assign`, `create_and_assign`, `assign_faces`, `clear_faces`, `list_presets`. Supports whole-object OR single-face / selected-face material slot assignment (`face_index`, `face_indices`, or `selection_mode` + `seed_face`/`invert`). Supports linear PBR properties (`base_color`, `secondary_color`, `metallic`, `roughness`, `emission_color`, `emission_strength`, `alpha`) and procedural patterns (`solid`, `checker`, `gradient`, `wood`, `noise`).
 - **Built-in Presets (12)**: `clay`, `matte_plastic`, `glossy_ceramic`, `chrome`, `gold`, `copper`, `wood`, `apple_skin`, `leaf_green`, `glass`, `emissive_cyan`, `emissive_amber`.
+
+### `texture_library`
+Search & fetch online multi-channel PBR texture packs (**Poly Haven**, **ambientCG**) or generate seamless local procedural PBR maps (`albedo`, `normal`, `roughness`, `metallic`, `ao`, `height`):
+- `action`: `"search"` | `"download_and_apply"` | `"generate_procedural"`.
+- `source`: `"all"` | `"polyhaven"` | `"ambientcg"` | `"procedural"`.
+- Automatically unpacks ARM channel-packed maps, builds `MaterialSpec`, assigns to `object_id`, and supports world-space triplanar UV fallback + Gram-Schmidt TBN bump mapping.
 
 ### `light_manage` & `camera_manage`
 - `light_manage`: `add`, `update`, `delete`, `setup_studio_3point`, `set_world`, `list` (`sun`, `point`, `spot`, `area`).
 - `camera_manage`: `add`, `update`, `set_active`, `auto_frame`, `delete`, `list` (perspective & orthographic).
 
+### `post_process_manage`
+Configure HDR post-processing and default scene render engine:
+- `action`: `"get"` | `"configure"` | `"set_preset"` | `"set_engine"`.
+- `render_engine`: `"software"` | `"raytrace"` (CPU BVH Path Tracer).
+- `preset`: `"cinematic"`, `"architectural"`, `"studio_clean"`, `"dramatic_bloom"`, `"raw_off"`.
+- Fine controls: `tone_mapper` (`aces`, `filmic`, `reinhard`, `none`), `exposure`, `bloom_*`, `ssao_*`, `dof_*`, `vignette_intensity`, `chromatic_aberration`, `saturation`, `contrast`, `temperature`, `sharpen`, `fxaa_enabled`.
+
 ### `render_viewport` & `render_views`
-Headless pure-CPU G-buffer rasterizer returning `[TextContent(metadata_json), ImageContent(png_base64)]`:
+Headless rendering returning `[TextContent(metadata_json), ImageContent(png_base64)]`:
+- `engine`: `None` (uses scene default), `"software"`, or `"raytrace"` (with `samples=1..16`).
 - **6 Viewport Shading Modes (`mode`)**: `pbr`, `clay`, `wireframe`, `normals`, `depth`, `collision`.
-- **Viewport Overlays**: `show_grid`, `show_axes` (XYZ orientation triad), `show_bounds` (yellow wireframe AABBs), `show_labels` (overlap-free object tags).
-- `render_views`: Renders a multi-angle 2x2 contact sheet (`front`, `right`, `top`, `iso` by default) so AI agents verify proportions and contacts in one turn.
+- **Viewport Overlays**: `show_grid`, `show_axes`, `show_bounds`, `show_labels`.
+- `render_views`: 2x2 multi-angle contact sheet (`front`, `right`, `top`, `iso` by default).
 
 ### `export_scene`
-Export scene to `.glb`, `.gltf` (including PBR materials and glTF 2.0 TRS animations), `.obj`, `.stl`, `.ply`, or standalone Blender `.py` build script.
+Export scene to **`.fbx`** (Kaydara Binary FBX 7.400), **`.fbx` (`format="fbx_ascii"`)**, **`.glb`**, **`.gltf`**, **`.obj`**, **`.stl`**, **`.ply`**, or standalone Blender **`.py`**.
+- `target_engine` (`"generic" | "unreal" | "unity" | "godot"`): Automatically handles Z-up vs Y-up axes, `UnitScaleFactor`, skeletal `LimbNode`s + `BindPose`, animation `AnimationCurve`s, baked cloth `BlendShape` morph targets, tangents/binormals, and textures.
 
 ---
 
-## 6. Keyframe Animation & Turntable Rendering (3 Tools)
+## 6. Keyframe Animation, Physics/Cloth, Skeletal Rigging & Video (6 Tools)
 
 - `timeline_manage`: `get`, `set_range` (`fps`, `frame_start`, `frame_end`), `set_frame` (`current_frame`).
 - `keyframe_manage`: `set`, `delete`, `list` scalar F-curves (`constant`, `linear`, `bezier` with `auto`/`ease_in`/`ease_out`/`ease_in_out`) targeting transforms (`location.x/y/z`, `rotation_deg.x/y/z`, `scale.x/y/z`), lights (`intensity`), cameras (`fov_deg`), or materials (`emission_strength`).
-- `render_animation`: Render `kind="turntable"` or `kind="timeline"` sequences (`steps=2..24`) returning filmstrip PNG `ImageContent` and optionally writing `.gif` + `.png` files.
+- `render_animation`: Render `kind="turntable"` or `kind="timeline"` sequences (`steps=2..24`, optional `engine` / `samples`) returning filmstrip PNG `ImageContent` and optional `.gif` / `.png` outputs.
+- `render_video_file`: Render high-frame-rate **`.mp4` (H.264)**, **`.webm` (VP9)**, **`.avi`**, or **`.gif`** videos for `kind="timeline" | "turntable" | "camera_path"` (with Catmull-Rom `camera_waypoints`), plus optional PNG frame sequences (`frames_dir`).
+- `physics_manage`:
+  - `set_rigid_body`: Configure `dynamic`/`static`/`kinematic` rigid bodies (`mass`, `restitution`, `friction`, `initial_velocity`, `collider_shape="box"|"sphere"|"mesh_aabb"`).
+  - `set_cloth`: Configure vectorized XPBD cloth (`stiffness`, `bend_stiffness`, `damping`, `wind`, `pin_mode="none"|"top_corners"|"top_edge"|"border"|"indices"`, `collision_margin`, `substeps`).
+  - `bake` / `clear_cache` / `list`: Simulate dynamics into F-curves + per-frame `vertex_cache`.
+- `armature_rig`:
+  - `create` / `add_bone`: Create FK hierarchical skeletons (`bones=[{"name", "parent", "head", "tail"}, ...]`).
+  - `auto_rig`: Compute normalized top-K inverse-distance bone skin weights (`SkinWeightSpec`) binding any mesh to an armature.
+  - `set_pose` / `keyframe_pose` / `list`: Pose or animate bone rotations/translations on `TimelineState`.
 
 ---
 
 ## 7. MCP Resources & Prompts
 
 ### Resources
-- `frfruit://scene/summary` — Live hierarchy, materials, timeline summary, undo/redo counts.
+- `frfruit://scene/summary` — Live hierarchy, materials, timeline summary, undo/redo status.
 - `frfruit://scene/document` — Full serialized `.frf.json` `SceneDocument`.
+- `frfruit://scene/postprocess` — Active `render_engine` and `PostProcessConfig`.
 - `frfruit://catalog/nodes` — Full procedural node definitions & sockets.
 - `frfruit://catalog/materials` — All 12 built-in PBR presets.
-- `frfruit://object/{object_id}` — Detailed metadata & evaluated world stats for a specific object.
+- `frfruit://catalog/textures` — Offline procedural styles and supported remote texture providers (`polyhaven`, `ambientcg`).
+- `frfruit://object/{object_id}` — Detailed metadata, `vertex_cache_frames`, and evaluated world stats for a specific object.
 
 ### Prompts
 - `build_3d_asset(concept, style="stylized")` — Construct -> place -> inspect -> shade -> render -> export loop.
 - `fix_geometry_issues(focus="all")` — Collision/normal/wireframe audit and repair loop.
-- `animate_turntable(subject="all")` — Timeline setup -> keyframes -> filmstrip/GIF preview -> GLB export.
+- `animate_turntable(subject="all")` — Timeline setup -> keyframes -> filmstrip/GIF preview -> export.

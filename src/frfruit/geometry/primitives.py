@@ -146,3 +146,45 @@ def make_plane(
             faces.append([a, b, c])
             faces.append([a, c, d])
     return MeshData(vertices=verts, faces=np.asarray(faces, dtype=np.int64), uvs=uvs)
+
+
+def create_primitive_mesh(
+    kind: str,
+    *,
+    size: float | Vec3 = 1.0,
+    radius: float = 0.5,
+    radius_top: float | None = None,
+    height: float = 1.0,
+    minor_radius: float = 0.15,
+    segments: int = 24,
+    origin: Literal["center", "bottom"] = "center",
+) -> MeshData:
+    """Unified factory for cube, sphere, icosphere, cylinder, cone, torus, capsule, plane."""
+    k = kind.lower()
+    if k == "cube":
+        return make_cube(size=size, origin=origin)
+    if k in ("sphere", "uv_sphere"):
+        return make_sphere(radius=radius, segments=segments, origin=origin)
+    if k == "icosphere":
+        sub = min(4, max(1, segments // 8))
+        return make_icosphere(radius=radius, subdivisions=sub, origin=origin)
+    if k == "cylinder":
+        return make_cylinder(
+            radius=radius, height=height, radius_top=radius_top, segments=segments, origin=origin
+        )
+    if k == "cone":
+        return make_cone(radius=radius, height=height, segments=segments, origin=origin)
+    if k == "torus":
+        return make_torus(
+            major_radius=radius,
+            minor_radius=minor_radius,
+            major_segments=segments,
+            minor_segments=max(8, segments // 2),
+            origin=origin,
+        )
+    if k == "capsule":
+        return make_capsule(radius=radius, height=height, segments=segments, origin=origin)
+    if k == "plane":
+        sx = float(size[0]) if isinstance(size, (tuple, list)) else float(size)
+        return make_plane(size=(sx, sx), subdivisions=max(1, segments))
+    raise ValueError(f"Unsupported primitive kind: {kind!r}")
