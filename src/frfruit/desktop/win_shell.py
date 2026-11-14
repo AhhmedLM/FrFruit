@@ -70,6 +70,14 @@ def _launch_windows_edge_app(url: str) -> subprocess.Popen | None:
     return None
 
 
+def _ensure_stdio() -> None:
+    """Ensure sys.stdout/stderr are valid streams in windowed PyInstaller builds."""
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+
+
 def launch_studio(
     host: str = "127.0.0.1",
     port: int = 8765,
@@ -78,6 +86,7 @@ def launch_studio(
     open_window: bool = True,
 ) -> None:
     """Start the FrFruit Studio + Co-Hosted MCP server and attach a native window."""
+    _ensure_stdio()
     chosen_port = (
         _find_free_port(preferred=port, host=host) if port != 0 else _find_free_port(0, host)
     )
@@ -89,7 +98,14 @@ def launch_studio(
         preload_project=project_path,
     )
 
-    config = uvicorn.Config(app, host=host, port=chosen_port, log_level="warning", access_log=False)
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=chosen_port,
+        log_level="warning",
+        access_log=False,
+        use_colors=False,
+    )
     server = uvicorn.Server(config)
 
     thread = threading.Thread(target=server.run, name="frfruit-studio-uvicorn", daemon=True)
