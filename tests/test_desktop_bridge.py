@@ -220,3 +220,133 @@ def test_desktop_studio_edit_mode_raycast_and_face_material_api(tmp_path: Path) 
         assert clr_r.status_code == 200
         geo_after_clr = client.get("/api/geometry").json()
         assert len([m for m in geo_after_clr["meshes"] if m["id"] == oid]) == 1
+
+
+def test_live_uvicorn_websocket_mcp_client_tracking_and_stdio_bridge(tmp_path: Path) -> None:
+    import asyncio
+    import socket
+    import sys
+    import threading
+    import time
+    import urllib.request
+
+    import uvicorn
+    import websockets
+    from mcp.client.session import ClientSession
+    from mcp.client.sse import sse_client
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.types import Implementation
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+
+    app, sess, _mcp = create_studio_app(workspace_root=tmp_path, host="127.0.0.1", port=port)
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+
+    # Wait until HTTP server is accepting connections
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/mcp/info", timeout=1.0) as r:
+                if r.status == 200:
+                    break
+        except Exception:
+            time.sleep(0.05)
+
+    async def _run_checks() -> None:
+        events: list[dict] = []
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws/events") as ws:
+            hello = json.loads(await ws.recv())
+            assert hello["event"] == "connected"
+            assert hello["mcp_clients_count"] == 0
+
+            async def _drain() -> None:
+                try:
+                    while True:
+                        events.append(json.loads(await ws.recv()))
+                except Exception:
+                    pass
+
+            reader_task = asyncio.create_task(_drain())
+            try:
+                # 1. Streamable HTTP MCP client connects & creates object
+                async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (r, w, *_):
+                    async with ClientSession(
+                        r, w, client_info=Implementation(name="antigravity-http", version="1.0")
+                    ) as session:
+                        await session.initialize()
+                        await asyncio.sleep(0.1)
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state") as resp:
+                            st = json.loads(resp.read())
+                        assert st["mcp_clients_count"] == 1
+                        assert st["mcp_clients"][0]["client_name"] == "antigravity-http"
+                        await session.call_tool(
+                            "create_primitive", {"primitive": "cube", "name": "LiveHttpCube"}
+                        )
+                        await asyncio.sleep(0.1)
+
+                await asyncio.sleep(0.1)
+
+                # 2. SSE MCP client connects & creates object
+                async with sse_client(f"http://127.0.0.1:{port}/sse") as (r, w):
+                    async with ClientSession(
+                        r, w, client_info=Implementation(name="antigravity-sse", version="1.0")
+                    ) as session:
+                        await session.initialize()
+                        await asyncio.sleep(0.1)
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state") as resp:
+                            st = json.loads(resp.read())
+                        assert st["mcp_clients_count"] == 1
+                        assert st["mcp_clients"][0]["client_name"] == "antigravity-sse"
+                        await session.call_tool(
+                            "create_primitive", {"primitive": "cylinder", "name": "LiveSseCyl"}
+                        )
+                        await asyncio.sleep(0.1)
+
+                await asyncio.sleep(0.1)
+
+                # 3. Stdio-to-Studio bridge connects & mutates the exact same Studio session
+                params = StdioServerParameters(
+                    command=sys.executable,
+                    args=[
+                        "-m",
+                        "frfruit.mcp_server.server",
+                        "--studio-url",
+                        f"http://127.0.0.1:{port}/mcp",
+                    ],
+                )
+                async with stdio_client(params) as (r, w):
+                    async with ClientSession(
+                        r, w, client_info=Implementation(name="antigravity-stdio", version="1.0")
+                    ) as session:
+                        await session.initialize()
+                        await asyncio.sleep(0.1)
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state") as resp:
+                            st = json.loads(resp.read())
+                        assert st["mcp_clients_count"] == 1
+                        assert st["mcp_clients"][0]["client_name"] == "antigravity-stdio"
+                        await session.call_tool(
+                            "create_primitive", {"primitive": "cone", "name": "LiveStdioCone"}
+                        )
+                        await asyncio.sleep(0.1)
+            finally:
+                reader_task.cancel()
+
+        ev_names = [e["event"] for e in events]
+        assert "mcp_client_connected" in ev_names
+        assert "mcp_tool_called" in ev_names
+        assert "mcp_client_disconnected" in ev_names
+        assert "scene_mutated" in ev_names
+
+        obj_names = {o.name for o in sess.scene.objects.values()}
+        assert {"LiveHttpCube", "LiveSseCyl", "LiveStdioCone"}.issubset(obj_names)
+
+    try:
+        asyncio.run(_run_checks())
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=3.0)

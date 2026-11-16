@@ -159,6 +159,7 @@ def register_scene_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessio
                 if res is None:
                     raise ToolError("Nothing to undo.")
                 sess.scene, label = res
+                sess.notify("scene_mutated", {"action": f"undo:{label}"})
                 return {"status": "ok", "action": "undo", "reverted_label": label}
 
             if action == "redo":
@@ -166,6 +167,7 @@ def register_scene_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessio
                 if res is None:
                     raise ToolError("Nothing to redo.")
                 sess.scene, label = res
+                sess.notify("scene_mutated", {"action": f"redo:{label}"})
                 return {"status": "ok", "action": "redo", "reapplied_label": label}
 
             if action == "list_snapshots":
@@ -183,6 +185,7 @@ def register_scene_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessio
                 avail = sess.history.list_snapshots()
                 raise ToolError(f"Snapshot {snapshot_name!r} not found. Available: {avail}")
             sess.scene = restored
+            sess.notify("scene_mutated", {"action": f"restore_snapshot:{snapshot_name}"})
             return {"status": "ok", "restored_snapshot": snapshot_name}
 
     @mcp.tool(

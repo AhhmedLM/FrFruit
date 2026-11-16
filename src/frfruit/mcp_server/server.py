@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
+import os
+from collections.abc import Sequence
 from pathlib import Path
 
+import anyio
+from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
+from mcp.server.stdio import stdio_server
 
 from frfruit.mcp_server.context import FrFruitSession
 from frfruit.mcp_server.prompts import register_prompts
@@ -60,9 +66,57 @@ def create_server(workspace_root: str | Path | None = None) -> tuple[MCPServer, 
 mcp, default_session = create_server()
 
 
-def main() -> None:
-    """Entry point for `frfruit-mcp` over stdio."""
-    mcp.run(transport="stdio")
+async def _bridge_stdio_to_studio(studio_url: str) -> None:
+    """Proxy stdio MCP JSON-RPC traffic directly to a running FrFruit Studio /mcp endpoint."""
+    async with (
+        stdio_server() as (stdio_read, stdio_write),
+        streamable_http_client(studio_url) as (http_read, http_write, *_),
+        anyio.create_task_group() as tg,
+    ):
+
+        async def _forward_stdio_to_http() -> None:
+            async for msg in stdio_read:
+                if isinstance(msg, Exception):
+                    continue
+                await http_write.send(msg)
+            tg.cancel_scope.cancel()
+
+        async def _forward_http_to_stdio() -> None:
+            async for msg in http_read:
+                if isinstance(msg, Exception):
+                    continue
+                await stdio_write.send(msg)
+            tg.cancel_scope.cancel()
+
+        tg.start_soon(_forward_stdio_to_http)
+        tg.start_soon(_forward_http_to_stdio)
+
+
+def run_studio_stdio_bridge(studio_url: str) -> None:
+    """Run synchronous stdio-to-Studio Streamable HTTP MCP bridge."""
+    anyio.run(_bridge_stdio_to_studio, studio_url)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Entry point for `frfruit-mcp` over stdio (or bridged to live FrFruit Studio)."""
+    parser = argparse.ArgumentParser(prog="frfruit-mcp", description="FrFruit MCP Server")
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace root directory for safe file reads/writes.",
+    )
+    parser.add_argument(
+        "--studio-url",
+        default=os.environ.get("FRFRUIT_STUDIO_URL"),
+        help="Optional running FrFruit Studio MCP endpoint (e.g. http://127.0.0.1:8765/mcp).",
+    )
+    args = parser.parse_args(argv)
+    if args.workspace:
+        default_session.set_workspace_root(args.workspace)
+    if args.studio_url:
+        run_studio_stdio_bridge(args.studio_url)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

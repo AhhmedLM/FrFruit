@@ -5,7 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import sys
+import threading
+import time
+import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +23,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from frfruit.animation.evaluator import apply_animation_frame
@@ -77,7 +83,11 @@ def _error_json(msg: str, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"status": "error", "error": str(msg)}, status_code=status_code)
 
 
-def _serialize_state(sess: FrFruitSession, mcp_srv: MCPServer) -> dict[str, Any]:
+def _serialize_state(
+    sess: FrFruitSession,
+    mcp_srv: MCPServer,
+    mcp_clients_fn: Callable[[], list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
     with sess.lock:
         sc = sess.scene
         evaluated = evaluate_scene_meshes(sc)
@@ -136,6 +146,7 @@ def _serialize_state(sess: FrFruitSession, mcp_srv: MCPServer) -> dict[str, Any]
 
         materials_out = {mid: mat.model_dump() for mid, mat in sc.materials.items()}
         tools_count = len(mcp_srv._tool_manager.list_tools())
+        clients = mcp_clients_fn() if mcp_clients_fn is not None else []
         return {
             "scene_name": sc.name,
             "workspace_root": str(sess.workspace_root),
@@ -167,6 +178,8 @@ def _serialize_state(sess: FrFruitSession, mcp_srv: MCPServer) -> dict[str, Any]
             "objects": objects_out,
             "materials": materials_out,
             "mcp_tools_count": tools_count,
+            "mcp_clients": clients,
+            "mcp_clients_count": len(clients),
             "audit_log": list(sess.audit_log[-40:]),
         }
 
@@ -541,15 +554,21 @@ def create_studio_app(
     tsec = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=[
+            "127.0.0.1",
             "127.0.0.1:*",
+            "localhost",
             "localhost:*",
+            "[::1]",
             "[::1]:*",
             "testserver",
             "testserver:*",
         ],
         allowed_origins=[
+            "http://127.0.0.1",
             "http://127.0.0.1:*",
+            "http://localhost",
             "http://localhost:*",
+            "http://[::1]",
             "http://[::1]:*",
             "http://testserver",
             "http://testserver:*",
@@ -565,8 +584,128 @@ def create_studio_app(
     ws_queues: set[asyncio.Queue[dict[str, Any]]] = set()
     ws_lock = asyncio.Lock()
 
+    mcp_clients_lock = threading.RLock()
+    mcp_clients: dict[str, dict[str, Any]] = {}
+    _CLIENT_IDLE_TTL_SEC = 300.0
+
+    def _snapshot_mcp_clients() -> list[dict[str, Any]]:
+        now = time.time()
+        with mcp_clients_lock:
+            stale_ids = [
+                sid
+                for sid, info in mcp_clients.items()
+                if info.get("active_streams", 0) <= 0
+                and (now - float(info.get("last_seen", now))) > _CLIENT_IDLE_TTL_SEC
+            ]
+            for sid in stale_ids:
+                mcp_clients.pop(sid, None)
+            return [
+                {
+                    "session_id": info["session_id"],
+                    "client_name": info["client_name"],
+                    "client_version": info["client_version"],
+                    "transport": info["transport"],
+                    "connected_at": info["connected_at"],
+                    "last_seen": info["last_seen"],
+                    "tool_calls": info["tool_calls"],
+                    "active_streams": info["active_streams"],
+                }
+                for info in mcp_clients.values()
+            ]
+
+    def _register_mcp_client(
+        session_id: str,
+        transport: str,
+        client_name: str | None = None,
+        client_version: str | None = None,
+        tool_called: str | None = None,
+        stream_delta: int = 0,
+    ) -> None:
+        now = time.time()
+        is_new = False
+        became_named = False
+        with mcp_clients_lock:
+            entry = mcp_clients.get(session_id)
+            if entry is None:
+                is_new = True
+                entry = {
+                    "session_id": session_id,
+                    "client_name": client_name or "MCP Client",
+                    "client_version": client_version or "",
+                    "transport": transport,
+                    "connected_at": now,
+                    "last_seen": now,
+                    "tool_calls": 0,
+                    "active_streams": 0,
+                }
+                mcp_clients[session_id] = entry
+            else:
+                entry["last_seen"] = now
+                if client_name and entry["client_name"] == "MCP Client":
+                    became_named = True
+                if client_name:
+                    entry["client_name"] = client_name
+                if client_version:
+                    entry["client_version"] = client_version
+                if transport:
+                    entry["transport"] = transport
+            if tool_called:
+                entry["tool_calls"] = int(entry.get("tool_calls", 0)) + 1
+            if stream_delta:
+                entry["active_streams"] = max(0, int(entry.get("active_streams", 0)) + stream_delta)
+            snap_entry = dict(entry)
+        clients_snap = _snapshot_mcp_clients()
+        if is_new or became_named:
+            sess.notify(
+                "mcp_client_connected",
+                {
+                    "session_id": session_id,
+                    "client_name": snap_entry["client_name"],
+                    "transport": snap_entry["transport"],
+                    "mcp_clients": clients_snap,
+                    "mcp_clients_count": len(clients_snap),
+                },
+            )
+        if tool_called:
+            sess.notify(
+                "mcp_tool_called",
+                {
+                    "session_id": session_id,
+                    "client_name": snap_entry["client_name"],
+                    "tool": tool_called,
+                    "mcp_clients": clients_snap,
+                    "mcp_clients_count": len(clients_snap),
+                },
+            )
+
+    def _unregister_mcp_client(session_id: str, stream_closed_only: bool = False) -> None:
+        removed: dict[str, Any] | None = None
+        with mcp_clients_lock:
+            entry = mcp_clients.get(session_id)
+            if entry is None:
+                return
+            if stream_closed_only:
+                entry["active_streams"] = max(0, int(entry.get("active_streams", 0)) - 1)
+                if entry["active_streams"] > 0:
+                    return
+                removed = mcp_clients.pop(session_id, None)
+            else:
+                removed = mcp_clients.pop(session_id, None)
+        if removed is not None:
+            clients_snap = _snapshot_mcp_clients()
+            sess.notify(
+                "mcp_client_disconnected",
+                {
+                    "session_id": session_id,
+                    "client_name": removed.get("client_name", "MCP Client"),
+                    "transport": removed.get("transport", ""),
+                    "mcp_clients": clients_snap,
+                    "mcp_clients_count": len(clients_snap),
+                },
+            )
+
     async def api_state(_req: Request) -> JSONResponse:
-        return JSONResponse(_serialize_state(sess, mcp_srv))
+        return JSONResponse(_serialize_state(sess, mcp_srv, _snapshot_mcp_clients))
 
     async def api_geometry(_req: Request) -> JSONResponse:
         return JSONResponse(_serialize_geometry(sess))
@@ -1365,6 +1504,7 @@ def create_studio_app(
         sse_url = f"{base_url}/sse"
         tools_list = sorted(t.name for t in mcp_srv._tool_manager.list_tools())
         ws_path_str = str(sess.workspace_root)
+        clients_snap = _snapshot_mcp_clients()
         configs = {
             "streamable_http_client": {
                 "mcpServers": {
@@ -1384,6 +1524,7 @@ def create_studio_app(
                 "mcpServers": {
                     "frfruit": {
                         "command": "frfruit-mcp",
+                        "args": ["--studio-url", stream_url],
                         "env": {"FRFRUIT_WORKSPACE": ws_path_str},
                     }
                 }
@@ -1399,6 +1540,8 @@ def create_studio_app(
                 "workspace_root": ws_path_str,
                 "tools_count": len(tools_list),
                 "tools": tools_list,
+                "mcp_clients": clients_snap,
+                "mcp_clients_count": len(clients_snap),
                 "configs": configs,
             }
         )
@@ -1409,11 +1552,14 @@ def create_studio_app(
         async with ws_lock:
             ws_queues.add(q)
         try:
+            clients_snap = _snapshot_mcp_clients()
             await ws.send_json(
                 {
                     "event": "connected",
                     "scene_name": sess.scene.name,
                     "tools_count": len(mcp_srv._tool_manager.list_tools()),
+                    "mcp_clients": clients_snap,
+                    "mcp_clients_count": len(clients_snap),
                 }
             )
             while True:
@@ -1489,7 +1635,199 @@ def create_studio_app(
             Mount("/", app=StaticFiles(directory=str(static_dir), html=True), name="static")
         )
 
+    class _McpTelemetryMiddleware:
+        """Observe MCP Streamable HTTP & SSE connections and tool calls without altering streams."""
+
+        def __init__(self, asgi_app: ASGIApp) -> None:
+            self.asgi_app = asgi_app
+
+        @staticmethod
+        def _parse_rpc_metadata(
+            body_bytes: bytes,
+        ) -> tuple[str | None, str | None, str | None, bool]:
+            if not body_bytes:
+                return None, None, None, False
+            try:
+                parsed = json.loads(body_bytes)
+            except Exception:
+                return None, None, None, False
+            msgs = parsed if isinstance(parsed, list) else [parsed]
+            client_name: str | None = None
+            client_version: str | None = None
+            tool_name: str | None = None
+            has_rpc = False
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                method = m.get("method")
+                if not isinstance(method, str):
+                    continue
+                has_rpc = True
+                params = m.get("params")
+                if not isinstance(params, dict):
+                    params = {}
+                if method == "initialize":
+                    cinfo = params.get("clientInfo")
+                    if isinstance(cinfo, dict):
+                        client_name = str(cinfo.get("name") or "MCP Client")
+                        client_version = str(cinfo.get("version") or "")
+                    else:
+                        client_name = "MCP Client"
+                elif method == "tools/call":
+                    tname = params.get("name")
+                    if isinstance(tname, str) and tname:
+                        tool_name = tname
+            return client_name, client_version, tool_name, has_rpc
+
+        @staticmethod
+        def _headers_dict(scope: Scope) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for k, v in scope.get("headers") or []:
+                out[k.decode("latin-1").lower()] = v.decode("latin-1")
+            return out
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope.get("type") != "http":
+                await self.asgi_app(scope, receive, send)
+                return
+
+            path = scope.get("path", "")
+            method = scope.get("method", "GET").upper()
+
+            if path == "/sse" and method == "GET":
+                sse_sid: str | None = None
+                fallback_sid = f"sse:{id(scope)}"
+
+                async def sse_send(message: Message) -> None:
+                    nonlocal sse_sid
+                    if message["type"] == "http.response.body" and sse_sid is None:
+                        chunk = message.get("body", b"").decode("utf-8", errors="ignore")
+                        m = re.search(r"session_id=([A-Za-z0-9_-]+)", chunk)
+                        if m:
+                            sse_sid = m.group(1)
+                            _register_mcp_client(sse_sid, "sse", stream_delta=1)
+                        else:
+                            sse_sid = fallback_sid
+                            _register_mcp_client(fallback_sid, "sse", stream_delta=1)
+                    await send(message)
+
+                try:
+                    await self.asgi_app(scope, receive, sse_send)
+                finally:
+                    if sse_sid is not None:
+                        _unregister_mcp_client(sse_sid, stream_closed_only=True)
+                return
+
+            if path == "/mcp":
+                req_headers = self._headers_dict(scope)
+                req_sid = req_headers.get("mcp-session-id")
+
+                if method == "GET":
+                    if req_sid:
+                        _register_mcp_client(req_sid, "streamable-http", stream_delta=1)
+                    try:
+                        await self.asgi_app(scope, receive, send)
+                    finally:
+                        if req_sid:
+                            _unregister_mcp_client(req_sid, stream_closed_only=True)
+                    return
+
+                if method == "DELETE":
+                    await self.asgi_app(scope, receive, send)
+                    if req_sid:
+                        _unregister_mcp_client(req_sid)
+                    return
+
+                if method == "POST":
+                    chunks: list[bytes] = []
+                    more = True
+                    while more:
+                        msg = await receive()
+                        if msg["type"] != "http.request":
+                            break
+                        chunks.append(msg.get("body", b""))
+                        more = bool(msg.get("more_body", False))
+                    body_bytes = b"".join(chunks)
+                    sent_body = False
+
+                    async def replay_receive() -> Message:
+                        nonlocal sent_body
+                        if not sent_body:
+                            sent_body = True
+                            return {"type": "http.request", "body": body_bytes, "more_body": False}
+                        return await receive()
+
+                    resp_status = 200
+                    resp_sid: str | None = None
+
+                    async def capture_send(message: Message) -> None:
+                        nonlocal resp_status, resp_sid
+                        if message["type"] == "http.response.start":
+                            resp_status = int(message.get("status", 200))
+                            for k, v in message.get("headers") or []:
+                                if k.decode("latin-1").lower() == "mcp-session-id":
+                                    resp_sid = v.decode("latin-1")
+                        await send(message)
+
+                    await self.asgi_app(scope, replay_receive, capture_send)
+                    cname, cver, tool_name, has_rpc = self._parse_rpc_metadata(body_bytes)
+                    sid = resp_sid or req_sid
+                    if resp_status < 400 and (sid or has_rpc):
+                        _register_mcp_client(
+                            sid or "http-stateless",
+                            "streamable-http",
+                            client_name=cname,
+                            client_version=cver,
+                            tool_called=tool_name,
+                        )
+                    return
+
+            if path.startswith("/messages") and method == "POST":
+                qs = urllib.parse.parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+                msg_sid = (qs.get("session_id") or [None])[0]
+                chunks = []
+                more = True
+                while more:
+                    msg = await receive()
+                    if msg["type"] != "http.request":
+                        break
+                    chunks.append(msg.get("body", b""))
+                    more = bool(msg.get("more_body", False))
+                body_bytes = b"".join(chunks)
+                sent_body = False
+
+                async def replay_msg_receive() -> Message:
+                    nonlocal sent_body
+                    if not sent_body:
+                        sent_body = True
+                        return {"type": "http.request", "body": body_bytes, "more_body": False}
+                    return await receive()
+
+                resp_status = 200
+
+                async def capture_msg_send(message: Message) -> None:
+                    nonlocal resp_status
+                    if message["type"] == "http.response.start":
+                        resp_status = int(message.get("status", 200))
+                    await send(message)
+
+                await self.asgi_app(scope, replay_msg_receive, capture_msg_send)
+                cname, cver, tool_name, has_rpc = self._parse_rpc_metadata(body_bytes)
+                if resp_status < 400 and (msg_sid or has_rpc):
+                    _register_mcp_client(
+                        msg_sid or "sse-default",
+                        "sse",
+                        client_name=cname,
+                        client_version=cver,
+                        tool_called=tool_name,
+                    )
+                return
+
+            await self.asgi_app(scope, receive, send)
+
     app = Starlette(routes=routes, lifespan=lifespan)
+    app.add_middleware(_McpTelemetryMiddleware)
     app.state.frfruit_session = sess
     app.state.frfruit_mcp = mcp_srv
+    app.state.get_mcp_clients = _snapshot_mcp_clients
     return app, sess, mcp_srv

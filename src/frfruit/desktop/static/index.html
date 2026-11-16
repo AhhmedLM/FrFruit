@@ -622,6 +622,19 @@
           <div class="tab-pane" id="tab-mcp">
             <div class="section-card">
               <div class="section-title">
+                <span>AI Client Connection</span>
+                <span class="mono" id="mcp-client-badge">0 CLIENTS</span>
+              </div>
+              <div id="mcp-client-status" class="result-banner" style="margin-top:0">
+                Bridge connecting...
+              </div>
+              <div id="mcp-client-list" style="margin-top:6px;font-size:10.5px;color:var(--text-secondary)">
+                Point Antigravity or another MCP client to <code>/mcp</code> (Streamable HTTP) or <code>/sse</code> to stream live 3D edits here.
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">
                 <span>MCP Bridge Endpoints</span>
                 <span class="mono" id="mcp-tools-badge">34 TOOLS</span>
               </div>
@@ -637,9 +650,10 @@
                 <span class="prop-label">WS Telemetry</span>
                 <input type="text" id="mcp-url-ws" class="mono" readonly />
               </div>
-              <div class="btn-row" style="margin-top:8px">
-                <button id="btn-copy-http">Copy Streamable JSON</button>
-                <button id="btn-copy-stdio">Copy Stdio JSON</button>
+              <div class="btn-row" style="margin-top:8px;flex-wrap:wrap">
+                <button id="btn-copy-http" class="primary">Copy HTTP JSON</button>
+                <button id="btn-copy-sse">Copy SSE JSON</button>
+                <button id="btn-copy-stdio">Copy Stdio Bridge</button>
               </div>
               <pre class="code-box" id="mcp-config-preview">{}</pre>
             </div>

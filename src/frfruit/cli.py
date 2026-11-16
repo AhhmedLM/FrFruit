@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 from frfruit.geometry.spatial import compute_scene_bounds, evaluate_scene_meshes
 from frfruit.io.exporters import export_scene_file
 from frfruit.io.project import load_project, save_project
-from frfruit.mcp_server.server import default_session, mcp
+from frfruit.mcp_server.server import default_session, mcp, run_studio_stdio_bridge
 from frfruit.physics.solver import bake_scene_physics
 from frfruit.render.video import render_video
 from frfruit.render.viewport import render_multiview_sheet, render_single_view
@@ -38,6 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--workspace",
         default=None,
         help="Workspace root directory for safe file reads/writes.",
+    )
+    p_serve.add_argument(
+        "--studio-url",
+        default=os.environ.get("FRFRUIT_STUDIO_URL"),
+        help=(
+            "Optional running FrFruit Studio MCP URL (e.g. http://127.0.0.1:8765/mcp) "
+            "to bridge stdio MCP calls into the live Studio viewport."
+        ),
     )
 
     p_app = sub.add_parser("app", help="Launch FrFruit Studio Desktop App + Co-Hosted MCP Bridge.")
@@ -146,7 +155,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.workspace:
             default_session.set_workspace_root(args.workspace)
         if args.transport == "stdio":
-            mcp.run(transport="stdio")
+            if args.studio_url:
+                run_studio_stdio_bridge(args.studio_url)
+            else:
+                mcp.run(transport="stdio")
         else:
             mcp.run(transport=args.transport, host=args.host, port=args.port)
         return 0

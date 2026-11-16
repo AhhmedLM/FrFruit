@@ -82,15 +82,16 @@ uv run frfruit app --no-window --workspace ./workspace --port 8765
 
 On Windows, double-click [`windows_app\FrFruitStudio.bat`](windows_app/FrFruitStudio.bat) or build a standalone binary (`dist\FrFruitStudio.exe`) using [`windows_app\build_windows_exe.ps1`](windows_app/build_windows_exe.ps1). See [`windows_app/README_WINDOWS.md`](windows_app/README_WINDOWS.md).
 
-While FrFruit Studio is open, point any MCP client at the co-hosted endpoint so every AI change streams live over WebSockets into your 3D viewport:
+While FrFruit Studio is open, point any MCP client at the co-hosted endpoint so every AI change streams live over WebSockets into your 3D viewport (the top-bar pill switches from **MCP READY** to **MCP CONNECTED**):
 - **Streamable HTTP MCP**: `http://127.0.0.1:8765/mcp`
 - **SSE MCP**: `http://127.0.0.1:8765/sse`
+- **Stdio Bridge to Live Studio**: `uv run frfruit serve --studio-url http://127.0.0.1:8765/mcp` (or `frfruit-mcp --studio-url http://127.0.0.1:8765/mcp`)
 
 ---
 
 ## Using FrFruit Headlessly with MCP Clients
 
-Add FrFruit via `stdio` to your MCP client configuration (Claude Desktop, Cursor, Antigravity, etc.):
+Add FrFruit via `stdio` to your MCP client configuration (Claude Desktop, Cursor, Antigravity, etc.) for standalone headless mode (or add `"--studio-url", "http://127.0.0.1:8765/mcp"` to attach to a running FrFruit Studio window):
 
 ```json
 {

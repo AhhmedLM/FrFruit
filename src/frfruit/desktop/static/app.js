@@ -13,6 +13,8 @@
     editElementMode: "face",
     lastSelectionRule: "top",
     mcpInfo: null,
+    mcpClients: [],
+    wsOpen: false,
     playing: false,
     playTimer: null,
     ws: null,
@@ -202,6 +204,11 @@
     $("pp-sat").value = String(pp.saturation ?? 1.05);
     $("pp-sat-v").textContent = Number(pp.saturation ?? 1.05).toFixed(2);
     $("pp-fxaa").checked = !!pp.fxaa_enabled;
+
+    if (Array.isArray(st.mcp_clients)) {
+      state.mcpClients = st.mcp_clients;
+      updateMcpStatusUI();
+    }
 
     if (st.audit_log && st.audit_log.length) {
       renderAuditLog(st.audit_log);
@@ -777,12 +784,20 @@
     toast("Copied Streamable HTTP MCP config", "ok");
   };
 
+  $("btn-copy-sse").onclick = () => {
+    if (!state.mcpInfo) return;
+    const txt = JSON.stringify(state.mcpInfo.configs.sse_client, null, 2);
+    $("mcp-config-preview").textContent = txt;
+    navigator.clipboard && navigator.clipboard.writeText(txt);
+    toast("Copied SSE MCP config", "ok");
+  };
+
   $("btn-copy-stdio").onclick = () => {
     if (!state.mcpInfo) return;
     const txt = JSON.stringify(state.mcpInfo.configs.stdio_client, null, 2);
     $("mcp-config-preview").textContent = txt;
     navigator.clipboard && navigator.clipboard.writeText(txt);
-    toast("Copied Stdio MCP config", "ok");
+    toast("Copied Studio Stdio Bridge MCP config", "ok");
   };
 
   $("btn-clear-audit").onclick = () => { $("mcp-audit-feed").innerHTML = ""; };

@@ -220,7 +220,8 @@ input[type="range"] {
   background: var(--text-muted);
   display: inline-block;
 }
-.led.online { background: var(--ok); }
+.led.online { background: var(--ok); box-shadow: 0 0 6px rgba(34, 197, 94, 0.7); }
+.led.ready { background: var(--accent); box-shadow: 0 0 5px rgba(59, 130, 246, 0.6); }
 .led.offline { background: var(--err); }
 
 /* Main 3-Column Dock */
