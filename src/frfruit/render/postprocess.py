@@ -165,7 +165,11 @@ def denoise_image(
     has_nrm = normal_buf is not None and normal_buf.shape[:2] == (h, w)
     has_dep = depth_buf is not None and depth_buf.shape[:2] == (h, w)
 
-    alb = np.asarray(albedo_buf, dtype=np.float64) if has_alb else None
+    alb = (
+        np.power(np.clip(np.asarray(albedo_buf, dtype=np.float64), 0.0, 1.0), 1.0 / 2.2)
+        if has_alb
+        else None
+    )
     nrm = np.asarray(normal_buf, dtype=np.float64) if has_nrm else None
     if has_dep and depth_buf is not None:
         dep_f = np.where(np.isfinite(depth_buf), depth_buf.astype(np.float64), -1.0)
@@ -176,7 +180,7 @@ def denoise_image(
     kernel_1d = (0.25, 0.5, 0.25)
     for step_pow in range(3):
         step = 1 << step_pow
-        sigma_c2 = (0.35 * (0.65**step_pow)) ** 2
+        scale_step = 0.72**step_pow
         acc = np.zeros_like(cur)
         w_sum = np.zeros((h, w, 1), dtype=np.float64)
 
@@ -197,15 +201,18 @@ def denoise_image(
                 xt0 = xs0 + dx
                 xt1 = xs1 + dx
 
+                center_c = cur[ys0:ys1, xs0:xs1]
                 nb_c = cur[yt0:yt1, xt0:xt1]
-                dc = nb_c - cur[ys0:ys1, xs0:xs1]
+                dc = nb_c - center_c
                 dc2 = np.sum(dc * dc, axis=2, keepdims=True)
-                wt = w_sp * np.exp(-dc2 / max(1e-5, sigma_c2))
+                luma_c = np.clip(_luminance(center_c), 0.0, 2.0)[..., None]
+                sigma_c = (0.42 + 0.55 * luma_c) * scale_step
+                wt = w_sp * np.exp(-dc2 / np.maximum(1e-5, sigma_c * sigma_c))
 
                 if alb is not None:
                     da = alb[yt0:yt1, xt0:xt1] - alb[ys0:ys1, xs0:xs1]
                     da2 = np.sum(da * da, axis=2, keepdims=True)
-                    wt = wt * np.exp(-da2 / 0.018)
+                    wt = wt * np.exp(-da2 / 0.0065)
 
                 if nrm is not None:
                     dn = nrm[yt0:yt1, xt0:xt1] - nrm[ys0:ys1, xs0:xs1]

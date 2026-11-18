@@ -158,6 +158,7 @@ class MaterialSpec(BaseModel):
     metallic_map: str | None = None
     ao_map: str | None = None
     height_map: str | None = None
+    normal_strength: float = Field(default=0.85, ge=0.0, le=3.0)
     uv_scale: Vec2 = (1.0, 1.0)
     texture_source: str | None = None
 

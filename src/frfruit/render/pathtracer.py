@@ -15,6 +15,7 @@ from frfruit.render.materials import evaluate_ggx_brdf, evaluate_material_maps
 from frfruit.render.postprocess import apply_post_processing
 from frfruit.render.sky import evaluate_world_sky
 from frfruit.render.software import RenderConfig, _draw_segment_z
+from frfruit.textures.loader import compute_triangle_tangents
 
 
 @dataclass
@@ -344,6 +345,19 @@ class PathTracerRenderer:
             mat_idx_per_tri = np.zeros((0,), dtype=np.int32)
             coll_per_tri = np.zeros((0,), dtype=bool)
 
+        if len(faces_w) > 0:
+            tri_t_w, tri_b_w = compute_triangle_tangents(
+                verts_w[faces_w[:, 0]],
+                verts_w[faces_w[:, 1]],
+                verts_w[faces_w[:, 2]],
+                uvs_w[faces_w[:, 0]],
+                uvs_w[faces_w[:, 1]],
+                uvs_w[faces_w[:, 2]],
+            )
+        else:
+            tri_t_w = np.zeros((0, 3), dtype=np.float64)
+            tri_b_w = np.zeros((0, 3), dtype=np.float64)
+
         bvh = _TriangleBVH(verts_w, faces_w, leaf_size=16)
 
         # Collect lights
@@ -509,7 +523,8 @@ class PathTracerRenderer:
                     base_ldir /= max(1e-9, float(np.linalg.norm(base_ldir)))
                     l_vec = np.broadcast_to(base_ldir[None, :], (k, 3)).copy()
                     if soft_shadows:
-                        jitter = rng.normal(0.0, 0.025, size=(k, 3))
+                        spread = 0.025 * max(1.0, min(14.0, float(lspec.size)))
+                        jitter = rng.normal(0.0, spread, size=(k, 3))
                         s_ray_d = l_vec + jitter
                         s_ray_d /= np.linalg.norm(s_ray_d, axis=1, keepdims=True)
                     else:
@@ -544,7 +559,10 @@ class PathTracerRenderer:
                 shadow = np.ones((k, 1), dtype=np.float64)
                 if cfg.enable_shadows and lspec.cast_shadows and np.any(lit_mask):
                     lit_idx = np.nonzero(lit_mask)[0]
-                    s_orig = pos[lit_idx] + nrm[lit_idx] * 1.5e-3
+                    offset_n = (
+                        extra_mat["geom_nrm"] if extra_mat and "geom_nrm" in extra_mat else nrm
+                    )
+                    s_orig = pos[lit_idx] + offset_n[lit_idx] * 1.5e-3
                     occ = bvh.intersect_occluded(s_orig, s_ray_d[lit_idx], max_d[lit_idx])
                     shadow[lit_idx, 0] = np.where(occ, 0.0, 1.0)
 
@@ -641,7 +659,12 @@ class PathTracerRenderer:
                     if not np.any(mask_m):
                         continue
                     alb_m, nrm_m, rgh_m, mtl_m, ao_m = evaluate_material_maps(
-                        mspec, pos[mask_m], shaded_nrm[mask_m], uvs=uv_hit[mask_m]
+                        mspec,
+                        pos[mask_m],
+                        shaded_nrm[mask_m],
+                        uvs=uv_hit[mask_m],
+                        tangent_w=tri_t_w[tri_ids[mask_m]],
+                        bitangent_w=tri_b_w[tri_ids[mask_m]],
                     )
                     albedo[mask_m] = alb_m
                     shaded_nrm[mask_m] = nrm_m
@@ -677,6 +700,7 @@ class PathTracerRenderer:
                 "sheen": sheen,
                 "subsurface": subsurface,
                 "subsurface_color": sss_col_resolved,
+                "geom_nrm": nrm_oriented,
             }
             return (
                 pos,
@@ -749,7 +773,7 @@ class PathTracerRenderer:
                     best_v[h_idx],
                 )
                 albedo_accum[h_idx] += albedo_lin
-                normal_accum[h_idx] += nrm
+                normal_accum[h_idx] += mat_extra["geom_nrm"]
 
                 ndv = np.clip(np.sum(nrm * view_dir, axis=1, keepdims=True), 0.0, 1.0)
                 f0 = 0.04 * (1.0 - metallic) + albedo_lin * metallic
@@ -771,13 +795,21 @@ class PathTracerRenderer:
                 pixel_rad = direct * alpha
 
                 # 1. Indirect diffuse GI bounce (cosine hemisphere weighted)
+                geom_nrm = mat_extra["geom_nrm"]
                 if max_bounces >= 2:
                     gi_weight = albedo_lin * (1.0 - metallic) * alpha * ao * 0.45
                     gi_active = np.max(gi_weight, axis=1) > 0.02
                     if np.any(gi_active):
                         g_i = np.nonzero(gi_active)[0]
                         gi_dirs = _cosine_hemisphere(nrm[g_i], rng)
-                        gi_orig = pos[g_i] + nrm[g_i] * 2e-3
+                        gi_gdot = np.sum(gi_dirs * geom_nrm[g_i], axis=1, keepdims=True)
+                        gi_dirs = np.where(
+                            gi_gdot < 0.02,
+                            gi_dirs + (0.02 - gi_gdot) * geom_nrm[g_i],
+                            gi_dirs,
+                        )
+                        gi_dirs /= np.maximum(np.linalg.norm(gi_dirs, axis=1, keepdims=True), 1e-12)
+                        gi_orig = pos[g_i] + geom_nrm[g_i] * 2e-3
                         gt, gtri, gu, gv = bvh.intersect_closest(gi_orig, gi_dirs)
                         ghit = gtri >= 0
                         gi_rad = np.zeros((len(g_i), 3), dtype=np.float64)
@@ -829,10 +861,17 @@ class PathTracerRenderer:
                     base_refl, cc_w * (1.0 - mat_extra["clearcoat_roughness"] * 0.5)
                 )
                 eff_rough = np.where(cc_w > base_refl, mat_extra["clearcoat_roughness"], roughness)
-                refl_active = (np.max(refl_weight, axis=1) > 0.04) & (max_bounces >= 2)
+                has_specular_lobe = (
+                    (eff_rough[:, 0] < 0.65)
+                    | (metallic[:, 0] > 0.15)
+                    | (mat_extra["clearcoat"][:, 0] > 0.15)
+                )
+                refl_active = (
+                    (np.max(refl_weight, axis=1) > 0.04) & (max_bounces >= 2) & has_specular_lobe
+                )
                 if np.any(refl_active):
                     r_i = np.nonzero(refl_active)[0]
-                    cur_o = pos[r_i] + nrm[r_i] * 2e-3
+                    cur_o = pos[r_i] + geom_nrm[r_i] * 2e-3
                     cur_d = (
                         dirs[h_idx[r_i]]
                         - 2.0
@@ -841,6 +880,13 @@ class PathTracerRenderer:
                     )
                     # Glossy microfacet roughness perturbation
                     cur_d += rng.normal(0.0, 1.0, size=cur_d.shape) * (eff_rough[r_i] ** 2 * 0.35)
+                    cur_d /= np.maximum(np.linalg.norm(cur_d, axis=1, keepdims=True), 1e-12)
+                    g_dot = np.sum(cur_d * geom_nrm[r_i], axis=1, keepdims=True)
+                    cur_d = np.where(
+                        g_dot < 0.02,
+                        cur_d + (0.02 - g_dot) * geom_nrm[r_i],
+                        cur_d,
+                    )
                     cur_d /= np.maximum(np.linalg.norm(cur_d, axis=1, keepdims=True), 1e-12)
                     tp = refl_weight[r_i].copy()
                     active_map = r_i.copy()
@@ -904,9 +950,13 @@ class PathTracerRenderer:
                         k_sub = np.nonzero(keep)[0]
                         d_in = cur_d[rh_sub[k_sub]]
                         n_in = r_nrm[k_sub]
+                        g_in = r_extra["geom_nrm"][k_sub]
                         cur_d = d_in - 2.0 * np.sum(d_in * n_in, axis=1, keepdims=True) * n_in
                         cur_d /= np.maximum(np.linalg.norm(cur_d, axis=1, keepdims=True), 1e-12)
-                        cur_o = r_pos[k_sub] + n_in * 2e-3
+                        g_dot2 = np.sum(cur_d * g_in, axis=1, keepdims=True)
+                        cur_d = np.where(g_dot2 < 0.02, cur_d + (0.02 - g_dot2) * g_in, cur_d)
+                        cur_d /= np.maximum(np.linalg.norm(cur_d, axis=1, keepdims=True), 1e-12)
+                        cur_o = r_pos[k_sub] + g_in * 2e-3
                         tp = tp[rh_sub[k_sub]] * next_w[k_sub]
                         active_map = active_map[rh_sub[k_sub]]
 

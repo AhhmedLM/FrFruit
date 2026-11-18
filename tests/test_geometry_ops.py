@@ -30,7 +30,7 @@ from frfruit.geometry.edit_ops import (
     subdivide_mesh,
     transform_selection,
 )
-from frfruit.geometry.mesh import GeometryError
+from frfruit.geometry.mesh import GeometryError, MeshData, concat_meshes
 from frfruit.geometry.primitives import (
     make_capsule,
     make_cone,
@@ -469,3 +469,25 @@ def test_quad_catmull_clark_subdivision_creases_and_smart_uv() -> None:
     )
     assert res_uv.face_material_ids == {0: "mat_gold", 1: "mat_gold"}
     assert res_uv.extra.get("uv_island_count") == 6
+
+
+def test_concat_meshes_preserves_uvs() -> None:
+    m1 = MeshData(
+        vertices=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        faces=np.array([[0, 1, 2]]),
+        uvs=np.array([[0.1, 0.2], [0.9, 0.2], [0.1, 0.8]]),
+        vertex_colors=np.array([[1.0, 0.0, 0.0, 1.0]] * 3),
+    )
+    m2 = MeshData(
+        vertices=np.array([[2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [2.0, 1.0, 0.0]]),
+        faces=np.array([[0, 1, 2]]),
+        uvs=np.array([[0.2, 0.3], [0.8, 0.3], [0.2, 0.9]]),
+        vertex_colors=np.array([[0.0, 1.0, 0.0, 1.0]] * 3),
+    )
+    merged = concat_meshes([m1, m2])
+    assert merged.uvs is not None
+    assert merged.uvs.shape == (6, 2)
+    assert np.allclose(merged.uvs[:3], m1.uvs)
+    assert np.allclose(merged.uvs[3:], m2.uvs)
+    assert merged.vertex_colors is not None
+    assert np.allclose(merged.vertex_colors[3:], m2.vertex_colors)

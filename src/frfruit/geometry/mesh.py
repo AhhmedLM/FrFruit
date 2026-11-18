@@ -262,17 +262,36 @@ def concat_meshes(meshes: list[MeshData]) -> MeshData:
     all_verts: list[np.ndarray] = []
     all_faces: list[np.ndarray] = []
     all_groups: list[np.ndarray] = []
+    has_any_uv = any(m.uvs is not None and len(m.uvs) == len(m.vertices) for m in non_empty)
+    has_any_vc = any(
+        m.vertex_colors is not None and len(m.vertex_colors) == len(m.vertices) for m in non_empty
+    )
+    all_uvs: list[np.ndarray] = []
+    all_vcs: list[np.ndarray] = []
     offset = 0
     for idx, m in enumerate(non_empty):
+        n_v = len(m.vertices)
         all_verts.append(m.vertices)
         all_faces.append(m.faces + offset)
         if m.face_groups is not None and len(m.face_groups) == len(m.faces):
             all_groups.append(m.face_groups)
         else:
             all_groups.append(np.full((len(m.faces),), idx, dtype=np.int32))
-        offset += len(m.vertices)
+        if has_any_uv:
+            if m.uvs is not None and len(m.uvs) == n_v:
+                all_uvs.append(m.uvs)
+            else:
+                all_uvs.append(np.full((n_v, 2), np.nan, dtype=np.float64))
+        if has_any_vc:
+            if m.vertex_colors is not None and len(m.vertex_colors) == n_v:
+                all_vcs.append(m.vertex_colors)
+            else:
+                all_vcs.append(np.ones((n_v, 4), dtype=np.float64))
+        offset += n_v
     return MeshData(
         vertices=np.vstack(all_verts),
         faces=np.vstack(all_faces),
+        uvs=np.vstack(all_uvs) if has_any_uv else None,
         face_groups=np.concatenate(all_groups),
+        vertex_colors=np.vstack(all_vcs) if has_any_vc else None,
     )

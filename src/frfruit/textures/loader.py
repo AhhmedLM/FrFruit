@@ -77,13 +77,50 @@ def sample_texture(
     return (top * (1.0 - fy) + bot * fy).astype(np.float64)
 
 
+def compute_triangle_tangents(
+    v0: np.ndarray,
+    v1: np.ndarray,
+    v2: np.ndarray,
+    uv0: np.ndarray,
+    uv1: np.ndarray,
+    uv2: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-triangle world-space tangent and bitangent vectors from UV gradients."""
+    n = len(v0)
+    t_out = np.zeros((n, 3), dtype=np.float64)
+    b_out = np.zeros((n, 3), dtype=np.float64)
+    if n == 0:
+        return t_out, b_out
+
+    dp1 = v1 - v0
+    dp2 = v2 - v0
+    duv1 = uv1 - uv0
+    duv2 = uv2 - uv0
+
+    finite = np.all(np.isfinite(duv1), axis=1) & np.all(np.isfinite(duv2), axis=1)
+    det = duv1[:, 0] * duv2[:, 1] - duv1[:, 1] * duv2[:, 0]
+    valid = finite & (np.abs(det) > 1e-10)
+    if np.any(valid):
+        inv_det = np.where(valid, 1.0 / np.where(valid, det, 1.0), 0.0)[:, None]
+        t_raw = (dp1 * duv2[:, 1:2] - dp2 * duv1[:, 1:2]) * inv_det
+        b_raw = (dp2 * duv1[:, 0:1] - dp1 * duv2[:, 0:1]) * inv_det
+        t_len = np.linalg.norm(t_raw, axis=1, keepdims=True)
+        b_len = np.linalg.norm(b_raw, axis=1, keepdims=True)
+        good_len = valid & (t_len[:, 0] > 1e-8) & (b_len[:, 0] > 1e-8)
+        t_out[good_len] = t_raw[good_len] / t_len[good_len]
+        b_out[good_len] = b_raw[good_len] / b_len[good_len]
+    return t_out, b_out
+
+
 def perturb_normals(
     nrm_world: np.ndarray,
     normal_rgb: np.ndarray,
     strength: float = 0.85,
+    tangent_w: np.ndarray | None = None,
+    bitangent_w: np.ndarray | None = None,
 ) -> np.ndarray:
     """Perturb surface normals using a tangent-space normal map via Gram-Schmidt TBN."""
-    if len(nrm_world) == 0 or len(normal_rgb) != len(nrm_world):
+    if len(nrm_world) == 0 or len(normal_rgb) != len(nrm_world) or strength <= 1e-5:
         return nrm_world
     ts = normal_rgb * 2.0 - 1.0
     ts[:, 0] *= strength
@@ -94,10 +131,27 @@ def perturb_normals(
         np.array([[1.0, 0.0, 0.0]]),
         np.array([[0.0, 0.0, 1.0]]),
     )
-    tangent = np.cross(up_ref, nrm_world)
-    t_len = np.linalg.norm(tangent, axis=1, keepdims=True)
-    tangent = tangent / np.where(t_len < 1e-8, 1.0, t_len)
-    bitangent = np.cross(nrm_world, tangent)
+    fallback_t = np.cross(up_ref, nrm_world)
+    ft_len = np.linalg.norm(fallback_t, axis=1, keepdims=True)
+    fallback_t = fallback_t / np.where(ft_len < 1e-8, 1.0, ft_len)
+    fallback_b = np.cross(nrm_world, fallback_t)
+
+    if tangent_w is not None and bitangent_w is not None and len(tangent_w) == len(nrm_world):
+        t_proj = tangent_w - np.sum(tangent_w * nrm_world, axis=1, keepdims=True) * nrm_world
+        tp_len = np.linalg.norm(t_proj, axis=1, keepdims=True)
+        has_uv_t = (tp_len[:, 0] > 1e-6) & (np.linalg.norm(bitangent_w, axis=1) > 1e-6)
+        tangent = np.where(
+            has_uv_t[:, None],
+            t_proj / np.where(tp_len < 1e-8, 1.0, tp_len),
+            fallback_t,
+        )
+        # Preserve UV handedness against triangle bitangent
+        auto_b = np.cross(nrm_world, tangent)
+        handed = np.where(np.sum(auto_b * bitangent_w, axis=1, keepdims=True) < 0.0, -1.0, 1.0)
+        bitangent = np.where(has_uv_t[:, None], auto_b * handed, fallback_b)
+    else:
+        tangent = fallback_t
+        bitangent = fallback_b
 
     perturbed = (
         tangent * ts[:, 0:1] + bitangent * ts[:, 1:2] + nrm_world * np.maximum(0.15, ts[:, 2:3])

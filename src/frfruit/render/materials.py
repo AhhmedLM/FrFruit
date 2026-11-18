@@ -143,6 +143,8 @@ def evaluate_material_maps(
     world_pos: np.ndarray,
     normals_w: np.ndarray,
     uvs: np.ndarray | None = None,
+    tangent_w: np.ndarray | None = None,
+    bitangent_w: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate full PBR material channels (albedo, normal, roughness, metallic, ao) for K samples.
 
@@ -172,7 +174,8 @@ def evaluate_material_maps(
     if not has_maps:
         return albedo, nrm_out, roughness, metallic, ao
 
-    if uvs is not None and len(uvs) == k and np.all(np.isfinite(uvs)):
+    has_valid_uvs = uvs is not None and len(uvs) == k and np.all(np.isfinite(uvs))
+    if has_valid_uvs:
         samp_uvs = uvs
     else:
         samp_uvs = compute_triplanar_uvs(world_pos, normals_w)
@@ -187,7 +190,13 @@ def evaluate_material_maps(
     if mat.normal_map:
         tex_nrm = sample_texture(mat.normal_map, samp_uvs, uv_scale=scale)
         if tex_nrm is not None:
-            nrm_out = perturb_normals(nrm_out, tex_nrm, strength=0.85)
+            nrm_out = perturb_normals(
+                nrm_out,
+                tex_nrm,
+                strength=float(mat.normal_strength),
+                tangent_w=tangent_w if has_valid_uvs else None,
+                bitangent_w=bitangent_w if has_valid_uvs else None,
+            )
 
     if mat.roughness_map:
         tex_rgh = sample_texture(mat.roughness_map, samp_uvs, uv_scale=scale)

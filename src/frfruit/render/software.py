@@ -17,6 +17,7 @@ from frfruit.render.camera import build_camera_matrices
 from frfruit.render.materials import evaluate_ggx_brdf, evaluate_material_maps
 from frfruit.render.postprocess import apply_post_processing
 from frfruit.render.sky import evaluate_world_sky
+from frfruit.textures.loader import compute_triangle_tangents
 
 RenderMode = Literal["pbr", "clay", "wireframe", "normals", "depth", "collision"]
 
@@ -470,6 +471,19 @@ class SoftwareRenderer:
             mat_idx_per_tri = np.zeros((0,), dtype=np.int32)
             coll_per_tri = np.zeros((0,), dtype=bool)
 
+        if len(faces_w) > 0:
+            tri_t_w, tri_b_w = compute_triangle_tangents(
+                verts_w[faces_w[:, 0]],
+                verts_w[faces_w[:, 1]],
+                verts_w[faces_w[:, 2]],
+                uvs_w[faces_w[:, 0]],
+                uvs_w[faces_w[:, 1]],
+                uvs_w[faces_w[:, 2]],
+            )
+        else:
+            tri_t_w = np.zeros((0, 3), dtype=np.float64)
+            tri_b_w = np.zeros((0, 3), dtype=np.float64)
+
         z_buf, tri_id_buf, u_buf, v_buf, edge_px_buf = _rasterize_gbuffer(
             verts_w,
             faces_w,
@@ -579,6 +593,8 @@ class SoftwareRenderer:
                             pos_w[mask_m],
                             shaded_nrm[mask_m],
                             uvs=uv_hit[mask_m],
+                            tangent_w=tri_t_w[tids[mask_m]],
+                            bitangent_w=tri_b_w[tids[mask_m]],
                         )
                         albedo[mask_m] = alb_m
                         shaded_nrm[mask_m] = nrm_m
