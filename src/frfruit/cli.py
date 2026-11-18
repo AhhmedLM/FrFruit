@@ -11,6 +11,11 @@ from pathlib import Path
 
 from frfruit.geometry.spatial import compute_scene_bounds, evaluate_scene_meshes
 from frfruit.io.exporters import export_scene_file
+from frfruit.io.model_fetcher import (
+    download_online_model,
+    import_online_model,
+    search_online_models,
+)
 from frfruit.io.project import load_project, save_project
 from frfruit.mcp_server.server import default_session, mcp, run_studio_stdio_bridge
 from frfruit.physics.solver import bake_scene_physics
@@ -132,6 +137,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_tex.add_argument("--resolution", choices=["1k", "2k", "4k"], default="1k")
     p_tex.add_argument("-o", "--out", default="./textures", help="Target directory for downloads.")
 
+    p_mod = sub.add_parser(
+        "models", help="Search, download, or import online CC0 3D models (Poly Haven)."
+    )
+    p_mod.add_argument("query", nargs="?", default="", help="Search keywords.")
+    p_mod.add_argument(
+        "--source",
+        choices=["all", "polyhaven", "procedural"],
+        default="all",
+    )
+    p_mod.add_argument("--download", default=None, help="Download specific model asset_id.")
+    p_mod.add_argument(
+        "--import-into", default=None, help="Target .frf.json project to import into."
+    )
+    p_mod.add_argument("--asset", default=None, help="Model asset_id when using --import-into.")
+    p_mod.add_argument(
+        "--pos",
+        type=float,
+        nargs=3,
+        default=[0.0, 0.0, 0.0],
+        metavar=("X", "Y", "Z"),
+        help="Placement location (X Y Z) in meters.",
+    )
+    p_mod.add_argument("--height", type=float, default=None, help="Target height in meters.")
+    p_mod.add_argument("--resolution", choices=["1k", "2k", "4k"], default="1k")
+    p_mod.add_argument("-o", "--out", default="./models", help="Target directory for downloads.")
+
     p_phys = sub.add_parser(
         "physics", help="Bake rigid-body & XPBD cloth physics into a .frf.json."
     )
@@ -243,6 +274,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(res, indent=2))
         else:
             hits = search_online_textures(query=args.query, source=args.source, limit=15)
+            print(json.dumps({"count": len(hits), "results": hits}, indent=2))
+        return 0
+
+    if args.command == "models":
+        if args.import_into:
+            asset_id = args.asset or args.download or args.query
+            if not asset_id:
+                parser.error("--import-into requires --asset <asset_id>")
+            src = "polyhaven" if args.source == "all" else args.source
+            scene = load_project(args.import_into)
+            res = import_online_model(
+                scene,
+                asset_id=asset_id,
+                source=src,
+                resolution=args.resolution,
+                target_dir=args.out,
+                location=(float(args.pos[0]), float(args.pos[1]), float(args.pos[2])),
+                target_height=args.height,
+                fallback_to_procedural=True,
+            )
+            save_project(scene, args.import_into)
+            print(json.dumps(res, indent=2))
+        elif args.download:
+            src = "polyhaven" if args.source == "all" else args.source
+            res = download_online_model(
+                asset_id=args.download,
+                source=src,
+                resolution=args.resolution,
+                target_dir=args.out,
+                fallback_to_procedural=True,
+            )
+            print(json.dumps(res, indent=2))
+        else:
+            hits = search_online_models(query=args.query, source=args.source, limit=15)
             print(json.dumps({"count": len(hits), "results": hits}, indent=2))
         return 0
 

@@ -142,3 +142,11 @@ class MeshPayload(BaseModel):
     uvs: list[list[float]] | None = None
     face_groups: list[int] | None = None
     vertex_colors: list[list[float]] | None = None
+
+    @field_validator("uvs", mode="before")
+    @classmethod
+    def _coerce_null_uvs(cls, v: list[list[float | None]] | None) -> list[list[float]] | None:
+        if v is None:
+            return None
+        nan = float("nan")
+        return [[nan if c is None else float(c) for c in pair] for pair in v]

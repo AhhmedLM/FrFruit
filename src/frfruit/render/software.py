@@ -32,6 +32,7 @@ class RenderConfig:
     enable_shadows: bool = True
     samples: int = 2
     max_bounces: int = 3
+    adaptive_threshold: float = 0.015
 
 
 def _rasterize_gbuffer(

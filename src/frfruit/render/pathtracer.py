@@ -26,12 +26,13 @@ class _BVHNode:
     right: _BVHNode | None = None
     start: int = 0
     end: int = 0
+    split_axis: int = 0
 
 
 class _TriangleBVH:
-    """Median-split AABB BVH with reordered contiguous triangle arrays for NumPy packets."""
+    """SAH AABB BVH with reordered contiguous leaf arrays & iterative parallel packet traversal."""
 
-    def __init__(self, verts: np.ndarray, faces: np.ndarray, leaf_size: int = 16) -> None:
+    def __init__(self, verts: np.ndarray, faces: np.ndarray, leaf_size: int = 8) -> None:
         self.count = len(faces)
         if self.count == 0:
             self.root: _BVHNode | None = None
@@ -41,6 +42,10 @@ class _TriangleBVH:
             self.v2 = np.zeros((0, 3), dtype=np.float64)
             self.e1 = np.zeros((0, 3), dtype=np.float64)
             self.e2 = np.zeros((0, 3), dtype=np.float64)
+            empty_c = np.zeros((0,), dtype=np.float64)
+            self.v0x = self.v0y = self.v0z = empty_c
+            self.e1x = self.e1y = self.e1z = empty_c
+            self.e2x = self.e2y = self.e2z = empty_c
             return
 
         v0 = verts[faces[:, 0]]
@@ -60,6 +65,20 @@ class _TriangleBVH:
         self.v2 = np.ascontiguousarray(v2[order])
         self.e1 = np.ascontiguousarray(self.v1 - self.v0)
         self.e2 = np.ascontiguousarray(self.v2 - self.v0)
+        self.v0x = np.ascontiguousarray(self.v0[:, 0])
+        self.v0y = np.ascontiguousarray(self.v0[:, 1])
+        self.v0z = np.ascontiguousarray(self.v0[:, 2])
+        self.e1x = np.ascontiguousarray(self.e1[:, 0])
+        self.e1y = np.ascontiguousarray(self.e1[:, 1])
+        self.e1z = np.ascontiguousarray(self.e1[:, 2])
+        self.e2x = np.ascontiguousarray(self.e2[:, 0])
+        self.e2y = np.ascontiguousarray(self.e2[:, 1])
+        self.e2z = np.ascontiguousarray(self.e2[:, 2])
+
+    @staticmethod
+    def _surface_area(bmin: np.ndarray, bmax: np.ndarray) -> float:
+        d = np.maximum(0.0, bmax - bmin)
+        return 2.0 * float(d[0] * d[1] + d[1] * d[2] + d[2] * d[0])
 
     def _build(
         self,
@@ -74,23 +93,88 @@ class _TriangleBVH:
         sl = order[start:end]
         bmin = np.min(tri_min[sl], axis=0)
         bmax = np.max(tri_max[sl], axis=0)
+        n_tris = end - start
 
-        if (end - start) <= self.leaf_size or depth >= 22:
+        if n_tris <= self.leaf_size or depth >= 24:
             return _BVHNode(bmin=bmin, bmax=bmax, start=start, end=end)
 
         cents = tri_cent[sl]
-        c_span = np.max(cents, axis=0) - np.min(cents, axis=0)
-        axis = int(np.argmax(c_span))
-        if c_span[axis] < 1e-8:
+        c_min = np.min(cents, axis=0)
+        c_max = np.max(cents, axis=0)
+        c_span = c_max - c_min
+        if float(np.max(c_span)) < 1e-8:
             return _BVHNode(bmin=bmin, bmax=bmax, start=start, end=end)
 
-        mid = (start + end) // 2
-        part = np.argpartition(cents[:, axis], mid - start)
-        order[start:end] = sl[part]
+        # Binned SAH across 8 bins when node is non-trivial
+        best_cost = float(n_tris)
+        best_axis = int(np.argmax(c_span))
+        best_split_val: float | None = None
+        parent_sa = max(1e-12, self._surface_area(bmin, bmax))
+
+        if n_tris > 16:
+            t_mins = tri_min[sl]
+            t_maxs = tri_max[sl]
+            n_bins = 8
+            for ax in range(3):
+                span = float(c_span[ax])
+                if span < 1e-8:
+                    continue
+                scale = n_bins / span
+                bins = np.clip(((cents[:, ax] - c_min[ax]) * scale).astype(np.int32), 0, n_bins - 1)
+                bin_cnt = np.zeros(n_bins, dtype=np.int32)
+                bin_min = np.full((n_bins, 3), np.inf, dtype=np.float64)
+                bin_max = np.full((n_bins, 3), -np.inf, dtype=np.float64)
+                for b in range(n_bins):
+                    bm = bins == b
+                    cnt = int(np.count_nonzero(bm))
+                    bin_cnt[b] = cnt
+                    if cnt > 0:
+                        bin_min[b] = np.min(t_mins[bm], axis=0)
+                        bin_max[b] = np.max(t_maxs[bm], axis=0)
+                # Sweep left-to-right and right-to-left over n_bins - 1 split planes
+                l_cnt = np.cumsum(bin_cnt[:-1])
+                r_cnt = n_tris - l_cnt
+                cur_lmin = np.full(3, np.inf)
+                cur_lmax = np.full(3, -np.inf)
+                l_sa = np.zeros(n_bins - 1, dtype=np.float64)
+                for b in range(n_bins - 1):
+                    if bin_cnt[b] > 0:
+                        cur_lmin = np.minimum(cur_lmin, bin_min[b])
+                        cur_lmax = np.maximum(cur_lmax, bin_max[b])
+                    if l_cnt[b] > 0:
+                        l_sa[b] = self._surface_area(cur_lmin, cur_lmax)
+                cur_rmin = np.full(3, np.inf)
+                cur_rmax = np.full(3, -np.inf)
+                for b in range(n_bins - 2, -1, -1):
+                    if bin_cnt[b + 1] > 0:
+                        cur_rmin = np.minimum(cur_rmin, bin_min[b + 1])
+                        cur_rmax = np.maximum(cur_rmax, bin_max[b + 1])
+                    if l_cnt[b] == 0 or r_cnt[b] == 0:
+                        continue
+                    r_sa = self._surface_area(cur_rmin, cur_rmax)
+                    cost = 0.5 + (l_sa[b] * l_cnt[b] + r_sa * r_cnt[b]) / parent_sa
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_axis = ax
+                        best_split_val = float(c_min[ax] + (b + 1) * (span / n_bins))
+
+        if best_split_val is not None:
+            left_m = cents[:, best_axis] < best_split_val
+            n_left = int(np.count_nonzero(left_m))
+            if 0 < n_left < n_tris:
+                order[start:end] = np.concatenate([sl[left_m], sl[~left_m]])
+                mid = start + n_left
+            else:
+                best_split_val = None
+
+        if best_split_val is None:
+            mid = (start + end) // 2
+            part = np.argpartition(cents[:, best_axis], mid - start)
+            order[start:end] = sl[part]
 
         left = self._build(order, start, mid, tri_min, tri_max, tri_cent, depth + 1)
         right = self._build(order, mid, end, tri_min, tri_max, tri_cent, depth + 1)
-        return _BVHNode(bmin=bmin, bmax=bmax, left=left, right=right)
+        return _BVHNode(bmin=bmin, bmax=bmax, left=left, right=right, split_axis=best_axis)
 
     def intersect_closest(
         self,
@@ -113,106 +197,117 @@ class _TriangleBVH:
             1.0 / np.where(np.abs(directions) > 1e-12, directions, 1.0),
             1e12 * np.where(directions >= 0.0, 1.0, -1.0),
         )
+        ox = np.ascontiguousarray(origins[:, 0])
+        oy = np.ascontiguousarray(origins[:, 1])
+        oz = np.ascontiguousarray(origins[:, 2])
+        dx = np.ascontiguousarray(directions[:, 0])
+        dy = np.ascontiguousarray(directions[:, 1])
+        dz = np.ascontiguousarray(directions[:, 2])
+        ix = np.ascontiguousarray(inv_d[:, 0])
+        iy = np.ascontiguousarray(inv_d[:, 1])
+        iz = np.ascontiguousarray(inv_d[:, 2])
 
-        # Traverse in spatially coherent 4096-ray chunks so working memory stays in cache
-        chunk = 4096
-        for s_idx in range(0, n_rays, chunk):
-            e_idx = min(n_rays, s_idx + chunk)
-            idx = np.arange(s_idx, e_idx, dtype=np.int32)
-            self._traverse_closest(
-                self.root,
-                idx,
-                origins,
-                directions,
-                inv_d,
-                best_t,
-                best_tri,
-                best_u,
-                best_v,
-            )
+        chunk = 2048
+        slices = [
+            np.arange(s_idx, min(n_rays, s_idx + chunk), dtype=np.int32)
+            for s_idx in range(0, n_rays, chunk)
+        ]
+
+        def run_chunk(idx0: np.ndarray) -> None:
+            stack: list[tuple[_BVHNode, np.ndarray]] = [(self.root, idx0)]  # type: ignore[list-item]
+            v0x, v0y, v0z = self.v0x, self.v0y, self.v0z
+            e1x, e1y, e1z = self.e1x, self.e1y, self.e1z
+            e2x, e2y, e2z = self.e2x, self.e2y, self.e2z
+            eps = 1e-7
+
+            while stack:
+                node, idx = stack.pop()
+                bx0, by0, bz0 = float(node.bmin[0]), float(node.bmin[1]), float(node.bmin[2])
+                bx1, by1, bz1 = float(node.bmax[0]), float(node.bmax[1]), float(node.bmax[2])
+
+                tx1 = (bx0 - ox[idx]) * ix[idx]
+                tx2 = (bx1 - ox[idx]) * ix[idx]
+                ty1 = (by0 - oy[idx]) * iy[idx]
+                ty2 = (by1 - oy[idx]) * iy[idx]
+                tz1 = (bz0 - oz[idx]) * iz[idx]
+                tz2 = (bz1 - oz[idx]) * iz[idx]
+
+                tmin = np.maximum(
+                    np.minimum(tx1, tx2),
+                    np.maximum(np.minimum(ty1, ty2), np.minimum(tz1, tz2)),
+                )
+                tmax = np.minimum(
+                    np.maximum(tx1, tx2),
+                    np.minimum(np.maximum(ty1, ty2), np.maximum(tz1, tz2)),
+                )
+                act = idx[(tmax >= np.maximum(0.0, tmin)) & (tmin <= best_t[idx])]
+                if len(act) == 0:
+                    continue
+
+                if node.left is None and node.right is None:
+                    s, e = node.start, node.end
+                    rdx = dx[act][:, None]
+                    rdy = dy[act][:, None]
+                    rdz = dz[act][:, None]
+                    le2x = e2x[s:e][None, :]
+                    le2y = e2y[s:e][None, :]
+                    le2z = e2z[s:e][None, :]
+                    le1x = e1x[s:e][None, :]
+                    le1y = e1y[s:e][None, :]
+                    le1z = e1z[s:e][None, :]
+
+                    hx = rdy * le2z - rdz * le2y
+                    hy = rdz * le2x - rdx * le2z
+                    hz = rdx * le2y - rdy * le2x
+                    a = le1x * hx + le1y * hy + le1z * hz
+                    valid = (a > eps) | (a < -eps)
+                    inv_a = np.where(valid, 1.0 / np.where(valid, a, 1.0), 0.0)
+
+                    sx = ox[act][:, None] - v0x[s:e][None, :]
+                    sy = oy[act][:, None] - v0y[s:e][None, :]
+                    sz = oz[act][:, None] - v0z[s:e][None, :]
+                    u = inv_a * (sx * hx + sy * hy + sz * hz)
+                    valid &= (u >= -eps) & (u <= 1.0 + eps)
+
+                    qx = sy * le1z - sz * le1y
+                    qy = sz * le1x - sx * le1z
+                    qz = sx * le1y - sy * le1x
+                    v = inv_a * (rdx * qx + rdy * qy + rdz * qz)
+                    valid &= (v >= -eps) & (u + v <= 1.0 + eps)
+
+                    t = inv_a * (le2x * qx + le2y * qy + le2z * qz)
+                    valid &= (t > 1e-5) & (t < best_t[act, None])
+
+                    if not np.any(valid):
+                        continue
+
+                    t_cand = np.where(valid, t, np.inf)
+                    local_k = np.argmin(t_cand, axis=1)
+                    min_t = t_cand[np.arange(len(act)), local_k]
+                    improved = min_t < best_t[act]
+                    if np.any(improved):
+                        g_idx = act[improved]
+                        k_sel = local_k[improved]
+                        best_t[g_idx] = min_t[improved]
+                        best_tri[g_idx] = self.orig_idx[s + k_sel]
+                        best_u[g_idx] = u[improved, k_sel]
+                        best_v[g_idx] = v[improved, k_sel]
+                else:
+                    if float(np.sum(directions[act, node.split_axis])) >= 0.0:
+                        if node.right is not None:
+                            stack.append((node.right, act))
+                        if node.left is not None:
+                            stack.append((node.left, act))
+                    else:
+                        if node.left is not None:
+                            stack.append((node.left, act))
+                        if node.right is not None:
+                            stack.append((node.right, act))
+
+        for sl in slices:
+            run_chunk(sl)
 
         return best_t, best_tri, best_u, best_v
-
-    def _hit_box_mask(
-        self,
-        node: _BVHNode,
-        idx: np.ndarray,
-        origins: np.ndarray,
-        inv_d: np.ndarray,
-        best_t: np.ndarray,
-    ) -> np.ndarray:
-        t1 = (node.bmin[None, :] - origins[idx]) * inv_d[idx]
-        t2 = (node.bmax[None, :] - origins[idx]) * inv_d[idx]
-        tmin = np.max(np.minimum(t1, t2), axis=1)
-        tmax = np.min(np.maximum(t1, t2), axis=1)
-        return (tmax >= np.maximum(0.0, tmin)) & (tmin <= best_t[idx])
-
-    def _traverse_closest(
-        self,
-        node: _BVHNode,
-        idx: np.ndarray,
-        origins: np.ndarray,
-        directions: np.ndarray,
-        inv_d: np.ndarray,
-        best_t: np.ndarray,
-        best_tri: np.ndarray,
-        best_u: np.ndarray,
-        best_v: np.ndarray,
-    ) -> None:
-        mask = self._hit_box_mask(node, idx, origins, inv_d, best_t)
-        act = idx[mask]
-        if len(act) == 0:
-            return
-
-        if node.left is None and node.right is None:
-            s, e = node.start, node.end
-            ro = origins[act][:, None, :]  # (A, 1, 3)
-            rd = directions[act][:, None, :]  # (A, 1, 3)
-            lv0 = self.v0[s:e][None, :, :]  # (1, C, 3)
-            le1 = self.e1[s:e][None, :, :]
-            le2 = self.e2[s:e][None, :, :]
-
-            h = np.cross(rd, le2)  # (A, C, 3)
-            a = np.sum(le1 * h, axis=2)  # (A, C)
-            eps = 1e-7
-            valid = np.abs(a) > eps
-            inv_a = np.where(valid, 1.0 / np.where(valid, a, 1.0), 0.0)
-
-            s_vec = ro - lv0
-            u = inv_a * np.sum(s_vec * h, axis=2)
-            valid &= (u >= -eps) & (u <= 1.0 + eps)
-
-            q = np.cross(s_vec, le1)
-            v = inv_a * np.sum(rd * q, axis=2)
-            valid &= (v >= -eps) & (u + v <= 1.0 + eps)
-
-            t = inv_a * np.sum(le2 * q, axis=2)
-            valid &= (t > 1e-5) & (t < best_t[act, None])
-
-            if not np.any(valid):
-                return
-
-            t_cand = np.where(valid, t, np.inf)
-            local_k = np.argmin(t_cand, axis=1)
-            min_t = t_cand[np.arange(len(act)), local_k]
-            improved = np.isfinite(min_t) & (min_t < best_t[act])
-            if np.any(improved):
-                g_idx = act[improved]
-                k_sel = local_k[improved]
-                best_t[g_idx] = min_t[improved]
-                best_tri[g_idx] = self.orig_idx[s + k_sel]
-                best_u[g_idx] = u[improved, k_sel]
-                best_v[g_idx] = v[improved, k_sel]
-            return
-
-        if node.left is not None:
-            self._traverse_closest(
-                node.left, act, origins, directions, inv_d, best_t, best_tri, best_u, best_v
-            )
-        if node.right is not None:
-            self._traverse_closest(
-                node.right, act, origins, directions, inv_d, best_t, best_tri, best_u, best_v
-            )
 
     def intersect_occluded(
         self,
@@ -220,12 +315,116 @@ class _TriangleBVH:
         directions: np.ndarray,
         max_dist: np.ndarray,
     ) -> np.ndarray:
-        """Return boolean occlusion array (N,) checking whether a hit exists in (1e-4, max_dist)."""
+        """Early-exit any-hit occlusion check in (1e-4, max_dist - 1e-3)."""
         n_rays = len(origins)
+        hit = np.zeros((n_rays,), dtype=bool)
         if self.root is None or n_rays == 0:
-            return np.zeros((n_rays,), dtype=bool)
-        best_t, best_tri, _, _ = self.intersect_closest(origins, directions, t_max_init=1e9)
-        return (best_tri >= 0) & (best_t < (max_dist - 1e-3))
+            return hit
+
+        inv_d = np.where(
+            np.abs(directions) > 1e-12,
+            1.0 / np.where(np.abs(directions) > 1e-12, directions, 1.0),
+            1e12 * np.where(directions >= 0.0, 1.0, -1.0),
+        )
+        ox = np.ascontiguousarray(origins[:, 0])
+        oy = np.ascontiguousarray(origins[:, 1])
+        oz = np.ascontiguousarray(origins[:, 2])
+        dx = np.ascontiguousarray(directions[:, 0])
+        dy = np.ascontiguousarray(directions[:, 1])
+        dz = np.ascontiguousarray(directions[:, 2])
+        ix = np.ascontiguousarray(inv_d[:, 0])
+        iy = np.ascontiguousarray(inv_d[:, 1])
+        iz = np.ascontiguousarray(inv_d[:, 2])
+        t_limit = np.maximum(1e-4, max_dist - 1e-3)
+
+        chunk = 2048
+        slices = [
+            np.arange(s_idx, min(n_rays, s_idx + chunk), dtype=np.int32)
+            for s_idx in range(0, n_rays, chunk)
+        ]
+
+        def run_occ_chunk(idx0: np.ndarray) -> None:
+            stack: list[tuple[_BVHNode, np.ndarray]] = [(self.root, idx0)]  # type: ignore[list-item]
+            v0x, v0y, v0z = self.v0x, self.v0y, self.v0z
+            e1x, e1y, e1z = self.e1x, self.e1y, self.e1z
+            e2x, e2y, e2z = self.e2x, self.e2y, self.e2z
+            eps = 1e-7
+
+            while stack:
+                node, cur_idx = stack.pop()
+                # Skip rays already occluded by earlier leaves
+                idx = cur_idx[~hit[cur_idx]]
+                if len(idx) == 0:
+                    continue
+
+                bx0, by0, bz0 = float(node.bmin[0]), float(node.bmin[1]), float(node.bmin[2])
+                bx1, by1, bz1 = float(node.bmax[0]), float(node.bmax[1]), float(node.bmax[2])
+
+                tx1 = (bx0 - ox[idx]) * ix[idx]
+                tx2 = (bx1 - ox[idx]) * ix[idx]
+                ty1 = (by0 - oy[idx]) * iy[idx]
+                ty2 = (by1 - oy[idx]) * iy[idx]
+                tz1 = (bz0 - oz[idx]) * iz[idx]
+                tz2 = (bz1 - oz[idx]) * iz[idx]
+
+                tmin = np.maximum(
+                    np.minimum(tx1, tx2),
+                    np.maximum(np.minimum(ty1, ty2), np.minimum(tz1, tz2)),
+                )
+                tmax = np.minimum(
+                    np.maximum(tx1, tx2),
+                    np.minimum(np.maximum(ty1, ty2), np.maximum(tz1, tz2)),
+                )
+                act = idx[(tmax >= np.maximum(1e-4, tmin)) & (tmin <= t_limit[idx])]
+                if len(act) == 0:
+                    continue
+
+                if node.left is None and node.right is None:
+                    s, e = node.start, node.end
+                    rdx = dx[act][:, None]
+                    rdy = dy[act][:, None]
+                    rdz = dz[act][:, None]
+                    le2x = e2x[s:e][None, :]
+                    le2y = e2y[s:e][None, :]
+                    le2z = e2z[s:e][None, :]
+                    le1x = e1x[s:e][None, :]
+                    le1y = e1y[s:e][None, :]
+                    le1z = e1z[s:e][None, :]
+
+                    hx = rdy * le2z - rdz * le2y
+                    hy = rdz * le2x - rdx * le2z
+                    hz = rdx * le2y - rdy * le2x
+                    a = le1x * hx + le1y * hy + le1z * hz
+                    valid = (a > eps) | (a < -eps)
+                    inv_a = np.where(valid, 1.0 / np.where(valid, a, 1.0), 0.0)
+
+                    sx = ox[act][:, None] - v0x[s:e][None, :]
+                    sy = oy[act][:, None] - v0y[s:e][None, :]
+                    sz = oz[act][:, None] - v0z[s:e][None, :]
+                    u = inv_a * (sx * hx + sy * hy + sz * hz)
+                    valid &= (u >= -eps) & (u <= 1.0 + eps)
+
+                    qx = sy * le1z - sz * le1y
+                    qy = sz * le1x - sx * le1z
+                    qz = sx * le1y - sy * le1x
+                    v = inv_a * (rdx * qx + rdy * qy + rdz * qz)
+                    valid &= (v >= -eps) & (u + v <= 1.0 + eps)
+
+                    t = inv_a * (le2x * qx + le2y * qy + le2z * qz)
+                    valid &= (t > 1e-4) & (t < t_limit[act, None])
+
+                    if np.any(valid):
+                        hit[act[np.any(valid, axis=1)]] = True
+                else:
+                    if node.right is not None:
+                        stack.append((node.right, act))
+                    if node.left is not None:
+                        stack.append((node.left, act))
+
+        for sl in slices:
+            run_occ_chunk(sl)
+
+        return hit
 
 
 def _cosine_hemisphere(normals: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -358,7 +557,7 @@ class PathTracerRenderer:
             tri_t_w = np.zeros((0, 3), dtype=np.float64)
             tri_b_w = np.zeros((0, 3), dtype=np.float64)
 
-        bvh = _TriangleBVH(verts_w, faces_w, leaf_size=16)
+        bvh = _TriangleBVH(verts_w, faces_w, leaf_size=8)
 
         # Collect lights
         lights: list[tuple[SceneObject, LightSpec]] = [
@@ -386,15 +585,21 @@ class PathTracerRenderer:
         max_bounces = max(1, int(cfg.max_bounces))
 
         def build_camera_rays(
-            jx: np.ndarray, jy: np.ndarray, lens_jitter: bool = False
+            jx: np.ndarray,
+            jy: np.ndarray,
+            lens_jitter: bool = False,
+            pix_indices: np.ndarray | None = None,
         ) -> tuple[np.ndarray, np.ndarray]:
-            ndc_x = ((px_flat + jx) / w) * 2.0 - 1.0
-            ndc_y = 1.0 - ((py_flat + jy) / h) * 2.0
+            px_s = px_flat if pix_indices is None else px_flat[pix_indices]
+            py_s = py_flat if pix_indices is None else py_flat[pix_indices]
+            m = len(px_s)
+            ndc_x = ((px_s + jx) / w) * 2.0 - 1.0
+            ndc_y = 1.0 - ((py_s + jy) / h) * 2.0
             if cam_spec.projection == "orthographic":
                 half_h = max(cam_spec.ortho_scale * 0.5, 1e-6)
                 half_w = half_h * aspect
                 orig_cam = np.stack([ndc_x * half_w, ndc_y * half_h, np.zeros_like(ndc_x)], axis=1)
-                dir_cam = np.broadcast_to(np.array([[0.0, 0.0, -1.0]]), (n_pix, 3))
+                dir_cam = np.broadcast_to(np.array([[0.0, 0.0, -1.0]]), (m, 3))
                 orig_w = orig_cam @ c2w[:3, :3].T + c2w[:3, 3][None, :]
                 dir_w = dir_cam @ c2w[:3, :3].T
                 dir_w /= np.linalg.norm(dir_w, axis=1, keepdims=True)
@@ -406,14 +611,14 @@ class PathTracerRenderer:
             dir_cam /= np.linalg.norm(dir_cam, axis=1, keepdims=True)
             dir_w = dir_cam @ c2w[:3, :3].T
             dir_w /= np.linalg.norm(dir_w, axis=1, keepdims=True)
-            orig_w = np.broadcast_to(eye_world[None, :], (n_pix, 3)).copy()
+            orig_w = np.broadcast_to(eye_world[None, :], (m, 3)).copy()
 
             if lens_jitter and scene.post_process.enabled and scene.post_process.dof_enabled:
                 ap = float(scene.post_process.dof_aperture) * 0.09
                 f_dist = max(0.2, float(scene.post_process.dof_focus_distance))
                 if ap > 1e-5:
-                    r_disk = np.sqrt(rng.random(n_pix)) * ap
-                    theta = rng.random(n_pix) * (2.0 * math.pi)
+                    r_disk = np.sqrt(rng.random(m)) * ap
+                    theta = rng.random(m) * (2.0 * math.pi)
                     right = c2w[:3, 0]
                     up_v = c2w[:3, 1]
                     focus_pt = orig_w + dir_w * f_dist
@@ -717,40 +922,52 @@ class PathTracerRenderer:
                 extra,
             )
 
+        pix_counts = np.zeros((n_pix, 1), dtype=np.float64)
+        active_pix = np.arange(n_pix, dtype=np.int32)
+        prev_mean = np.zeros((n_pix, 3), dtype=np.float64)
+        min_adapt = 2 if samples <= 4 else 3
+
         for s_idx in range(samples):
+            m = len(active_pix)
+            if m == 0:
+                break
             jx = (
-                np.full(n_pix, 0.5)
+                np.full(m, 0.5)
                 if samples == 1
-                else np.clip(0.5 + (rng.random(n_pix) - 0.5) * 0.85, 0.0, 1.0)
+                else np.clip(0.5 + (rng.random(m) - 0.5) * 0.85, 0.0, 1.0)
             )
             jy = (
-                np.full(n_pix, 0.5)
+                np.full(m, 0.5)
                 if samples == 1
-                else np.clip(0.5 + (rng.random(n_pix) - 0.5) * 0.85, 0.0, 1.0)
+                else np.clip(0.5 + (rng.random(m) - 0.5) * 0.85, 0.0, 1.0)
             )
-            orig, dirs = build_camera_rays(jx, jy, lens_jitter=(samples > 0))
+            orig, dirs = build_camera_rays(
+                jx, jy, lens_jitter=(samples > 0), pix_indices=active_pix
+            )
 
             best_t, best_tri, best_u, best_v = bvh.intersect_closest(orig, dirs)
             hit_mask = best_tri >= 0
 
             if s_idx == 0 and np.any(hit_mask):
-                depth_cam[hit_mask] = best_t[hit_mask].astype(np.float32)
+                g_d = active_pix[hit_mask]
+                depth_cam[g_d] = best_t[hit_mask].astype(np.float32)
                 # Compute NDC depth for optional grid overlay alignment
                 hit_pts = orig[hit_mask] + dirs[hit_mask] * best_t[hit_mask, None]
                 hom = np.hstack([hit_pts, np.ones((len(hit_pts), 1), dtype=np.float64)])
                 clip = hom @ vp.T
                 w_safe = np.where(np.abs(clip[:, 3]) < 1e-6, 1e-6, clip[:, 3])
-                z_ndc_buf[hit_mask] = (clip[:, 2] / w_safe).astype(np.float32)
+                z_ndc_buf[g_d] = (clip[:, 2] / w_safe).astype(np.float32)
 
-            sample_rgb = np.zeros((n_pix, 3), dtype=np.float64)
+            sample_rgb = np.zeros((m, 3), dtype=np.float64)
             miss_mask = ~hit_mask
             if np.any(miss_mask):
                 sky_miss = _sample_sky(dirs[miss_mask], scene, sun_dirs)
                 sample_rgb[miss_mask] = sky_miss
-                albedo_accum[miss_mask] += np.clip(sky_miss, 0.0, 1.0)
+                albedo_accum[active_pix[miss_mask]] += np.clip(sky_miss, 0.0, 1.0)
 
             if np.any(hit_mask):
                 h_idx = np.nonzero(hit_mask)[0]
+                g_h = active_pix[h_idx]
                 (
                     pos,
                     nrm,
@@ -772,8 +989,8 @@ class PathTracerRenderer:
                     best_u[h_idx],
                     best_v[h_idx],
                 )
-                albedo_accum[h_idx] += albedo_lin
-                normal_accum[h_idx] += mat_extra["geom_nrm"]
+                albedo_accum[g_h] += albedo_lin
+                normal_accum[g_h] += mat_extra["geom_nrm"]
 
                 ndv = np.clip(np.sum(nrm * view_dir, axis=1, keepdims=True), 0.0, 1.0)
                 f0 = 0.04 * (1.0 - metallic) + albedo_lin * metallic
@@ -1039,11 +1256,23 @@ class PathTracerRenderer:
 
                 sample_rgb[h_idx] = pixel_rad
 
-            radiance_accum += sample_rgb
+            radiance_accum[active_pix] += sample_rgb
+            pix_counts[active_pix] += 1.0
 
-        hdr_buf = (radiance_accum / samples).reshape((h, w, 3)).astype(np.float32)
-        albedo_2d = (albedo_accum / samples).reshape((h, w, 3)).astype(np.float32)
-        normal_2d = (normal_accum / samples).reshape((h, w, 3)).astype(np.float32)
+            if cfg.adaptive_threshold > 0.0 and samples > min_adapt and (s_idx + 1) < samples:
+                cur_mean = radiance_accum[active_pix] / pix_counts[active_pix]
+                if (s_idx + 1) >= min_adapt:
+                    diff = np.max(np.abs(cur_mean - prev_mean[active_pix]), axis=1)
+                    tol = cfg.adaptive_threshold * (0.25 + np.max(cur_mean, axis=1))
+                    prev_mean[active_pix] = cur_mean
+                    active_pix = active_pix[diff > tol]
+                else:
+                    prev_mean[active_pix] = cur_mean
+
+        inv_counts = 1.0 / np.maximum(pix_counts, 1.0)
+        hdr_buf = (radiance_accum * inv_counts).reshape((h, w, 3)).astype(np.float32)
+        albedo_2d = (albedo_accum * inv_counts).reshape((h, w, 3)).astype(np.float32)
+        normal_2d = (normal_accum * inv_counts).reshape((h, w, 3)).astype(np.float32)
         depth_2d = depth_cam.reshape((h, w))
         z_2d = z_ndc_buf.reshape((h, w))
 

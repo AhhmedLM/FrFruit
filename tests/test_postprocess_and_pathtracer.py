@@ -326,3 +326,40 @@ def test_physical_sky_hdri_ggx_coat_sheen_sss_and_bilateral_denoiser(tmp_path) -
         png_b, _ = render_single_view(sc, width=180, height=135, mode="pbr", engine=eng, samples=2)
         arr = np.asarray(Image.open(io.BytesIO(png_b)))
         assert arr.shape == (135, 180, 3) and arr.std() > 10.0
+
+
+def test_pathtracer_adaptive_sampling_and_sah_bvh() -> None:
+    from frfruit.render.pathtracer import _TriangleBVH
+
+    # Build >16 triangles (icosphere/uv_sphere) to exercise 8-bin SAH splitting & stack traversal
+    sph = create_primitive_mesh("uv_sphere", radius=0.8, segments=16)
+    bvh = _TriangleBVH(sph.vertices, sph.faces, leaf_size=8)
+    origins = np.array([[0.0, -3.0, 0.0], [5.0, -3.0, 5.0]], dtype=np.float64)
+    dirs = np.array([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    t_hit, tri_hit, _, _ = bvh.intersect_closest(origins, dirs)
+    assert tri_hit[0] >= 0 and 2.1 <= float(t_hit[0]) <= 2.35
+    assert tri_hit[1] == -1
+
+    occ = bvh.intersect_occluded(origins, dirs, np.array([10.0, 10.0], dtype=np.float64))
+    assert bool(occ[0]) is True and bool(occ[1]) is False
+
+    # Adaptive sampling at samples=4 renders cleanly without artifacts
+    sc = SceneDocument.new_default("AdaptiveRT")
+    sc.objects["orb"] = SceneObject(
+        id="orb",
+        name="Orb",
+        kind="mesh",
+        transform=Transform(location=(0.0, 0.0, 0.8)),
+        mesh=sph.to_payload(),
+    )
+    sc.objects["sun"] = SceneObject(
+        id="sun",
+        name="Sun",
+        kind="light",
+        light=LightSpec(kind="sun", intensity=2.4, direction=(-0.4, 0.5, -0.7)),
+    )
+    png_b, _ = render_single_view(
+        sc, width=120, height=90, mode="pbr", engine="raytrace", samples=4
+    )
+    arr = np.asarray(Image.open(io.BytesIO(png_b)))
+    assert arr.shape == (90, 120, 3) and arr.std() > 8.0

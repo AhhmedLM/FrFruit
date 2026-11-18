@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=128)
 def load_texture_array(path: str) -> np.ndarray | None:
     """Load an image file into an (H, W, 3) float32 array in 0..1 (flipped V=bottom-up)."""
     p = Path(path)
