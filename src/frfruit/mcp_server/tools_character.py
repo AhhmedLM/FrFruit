@@ -351,7 +351,7 @@ def register_character_tools(
                 except (ValueError, ValidationError) as exc:
                     raise ToolError(f"Invalid character parameters: {exc}") from exc
 
-                sess.push_history(f"character_create:{spec.preset}")
+                sess.push_history(f"character_create:{spec.preset}", notify=False)
                 res = build_or_update_character(
                     sess.scene,
                     spec,
@@ -361,7 +361,7 @@ def register_character_tools(
                     collection_id=collection_id,
                     cache_root=sess.workspace_root,
                 )
-                sess.notify("character_updated", {"object_id": res["object_id"]})
+                sess.notify("character_created", {"object_id": res["object_id"]})
                 return res
 
             # Remaining actions operate on an existing character object
@@ -416,7 +416,7 @@ def register_character_tools(
                 except (ValueError, ValidationError) as exc:
                     raise ToolError(f"Invalid character update: {exc}") from exc
 
-                sess.push_history(f"character_update:{obj.id}")
+                sess.push_history(f"character_update:{obj.id}", notify=False)
                 res = build_or_update_character(
                     sess.scene,
                     spec,
@@ -450,7 +450,7 @@ def register_character_tools(
                         "Specify sculpt_region or sculpt_center (or clear_rbf=True) for sculpt_rbf."
                     )
 
-                sess.push_history(f"character_sculpt_rbf:{obj.id}")
+                sess.push_history(f"character_sculpt_rbf:{obj.id}", notify=False)
                 res = build_or_update_character(
                     sess.scene,
                     spec,

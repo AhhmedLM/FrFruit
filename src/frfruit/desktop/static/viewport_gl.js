@@ -483,37 +483,13 @@
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
         gl.bindVertexArray(null);
 
-        // Build wireframe edge positions (stride 6 floats: x,y,z, r,g,b)
-        const wireArr = new Float32Array(idx.length * 2 * 6);
-        for (let t = 0; t < idx.length; t += 3) {
-          const pairs = [[idx[t], idx[t + 1]], [idx[t + 1], idx[t + 2]], [idx[t + 2], idx[t]]];
-          for (let p = 0; p < 3; p++) {
-            const base = (t * 2 + p * 2) * 6;
-            const a = pairs[p][0] * 3;
-            const b = pairs[p][1] * 3;
-            wireArr[base] = pos[a]; wireArr[base + 1] = pos[a + 1]; wireArr[base + 2] = pos[a + 2];
-            wireArr[base + 3] = 0.36; wireArr[base + 4] = 0.65; wireArr[base + 5] = 0.96;
-            wireArr[base + 6] = pos[b]; wireArr[base + 7] = pos[b + 1]; wireArr[base + 8] = pos[b + 2];
-            wireArr[base + 9] = 0.36; wireArr[base + 10] = 0.65; wireArr[base + 11] = 0.96;
-          }
-        }
-        const wireVao = gl.createVertexArray();
-        const wireBuf = gl.createBuffer();
-        gl.bindVertexArray(wireVao);
-        gl.bindBuffer(gl.ARRAY_BUFFER, wireBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, wireArr, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
-        gl.enableVertexAttribArray(1);
-        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
-        gl.bindVertexArray(null);
-
         this.meshes.push({
           id: md.id,
           name: md.name,
           vao, posBuf, normBuf, uvBuf, idxBuf,
           count: idx.length,
-          wireVao, wireBuf,
+          pos, idx,
+          wireVao: null, wireBuf: null,
           wireVertCount: idx.length * 2,
           bounds: md.bounds,
           material: md.material,
@@ -525,6 +501,38 @@
       } else {
         this.render();
       }
+    }
+
+    _ensureWireframe(m) {
+      if (m.wireVao || !this.gl) return;
+      const gl = this.gl;
+      const pos = m.pos;
+      const idx = m.idx;
+      const wireArr = new Float32Array(idx.length * 2 * 6);
+      for (let t = 0; t < idx.length; t += 3) {
+        const pairs = [[idx[t], idx[t + 1]], [idx[t + 1], idx[t + 2]], [idx[t + 2], idx[t]]];
+        for (let p = 0; p < 3; p++) {
+          const base = (t * 2 + p * 2) * 6;
+          const a = pairs[p][0] * 3;
+          const b = pairs[p][1] * 3;
+          wireArr[base] = pos[a]; wireArr[base + 1] = pos[a + 1]; wireArr[base + 2] = pos[a + 2];
+          wireArr[base + 3] = 0.36; wireArr[base + 4] = 0.65; wireArr[base + 5] = 0.96;
+          wireArr[base + 6] = pos[b]; wireArr[base + 7] = pos[b + 1]; wireArr[base + 8] = pos[b + 2];
+          wireArr[base + 9] = 0.36; wireArr[base + 10] = 0.65; wireArr[base + 11] = 0.96;
+        }
+      }
+      const wireVao = gl.createVertexArray();
+      const wireBuf = gl.createBuffer();
+      gl.bindVertexArray(wireVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, wireBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, wireArr, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 24, 0);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 24, 12);
+      gl.bindVertexArray(null);
+      m.wireVao = wireVao;
+      m.wireBuf = wireBuf;
     }
 
     fitScene(targetObjId = null) {
@@ -653,6 +661,7 @@
         gl.uniformMatrix4fv(gl.getUniformLocation(this.lineProg, "uVP"), false, vp);
         gl.uniform1f(gl.getUniformLocation(this.lineProg, "uAlpha"), 0.85);
         for (const m of this.meshes) {
+          this._ensureWireframe(m);
           gl.bindVertexArray(m.wireVao);
           gl.drawArrays(gl.LINES, 0, m.wireVertCount);
         }

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
+import json
 import os
 import socket
 import subprocess
@@ -20,11 +23,43 @@ import uvicorn
 from frfruit.desktop.server import create_studio_app
 
 
+def studio_session_file() -> Path:
+    """Return the path to the active Studio discovery file."""
+    return Path.home() / ".frfruit" / "studio_session.json"
+
+
+def _write_studio_session(base_url: str, workspace: Path) -> None:
+    path = studio_session_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "url": f"{base_url}/mcp",
+            "base_url": base_url,
+            "pid": os.getpid(),
+            "workspace": str(workspace),
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _cleanup_studio_session() -> None:
+    path = studio_session_file()
+    try:
+        if not path.is_file():
+            return
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if int(data.get("pid", -1)) == os.getpid():
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _find_free_port(preferred: int = 8765, host: str = "127.0.0.1") -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, preferred))
-            return preferred
+            return int(s.getsockname()[1])
         except OSError:
             s.bind((host, 0))
             return int(s.getsockname()[1])
@@ -113,58 +148,59 @@ def launch_studio(
 
     base_url = f"http://{host}:{chosen_port}"
     _wait_ready(f"{base_url}/api/mcp/info", timeout=12.0)
+    _write_studio_session(base_url, ws_root)
+    atexit.register(_cleanup_studio_session)
 
     print(f"FrFruit Studio Workstation online: {base_url}")
     print(f"MCP Streamable HTTP Endpoint   : {base_url}/mcp")
     print(f"MCP SSE Endpoint               : {base_url}/sse")
     print(f"Workspace Directory            : {ws_root}")
 
-    if not open_window:
+    try:
+        if not open_window:
+            try:
+                while thread.is_alive():
+                    time.sleep(0.4)
+            except KeyboardInterrupt:
+                server.should_exit = True
+            return
+
+        # 1. Try native Edge WebView2 / pywebview desktop window
+        with contextlib.suppress(Exception):
+            import webview  # type: ignore[import-not-found]
+
+            webview.create_window(
+                "FrFruit Studio Workstation",
+                url=base_url,
+                width=1500,
+                height=920,
+                min_size=(1080, 680),
+                background_color="#0e1013",
+            )
+            webview.start()
+            server.should_exit = True
+            return
+
+        # 2. Try native Edge/Chrome --app= desktop mode on Windows
+        proc = _launch_windows_edge_app(base_url)
+        if proc is not None:
+            try:
+                proc.wait()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.should_exit = True
+            return
+
+        # 3. Fallback: open browser tab and serve until Ctrl+C
+        webbrowser.open(base_url)
         try:
             while thread.is_alive():
                 time.sleep(0.4)
         except KeyboardInterrupt:
             server.should_exit = True
-        return
-
-    # 1. Try native Edge WebView2 / pywebview desktop window
-    try:
-        import webview  # type: ignore[import-not-found]
-
-        webview.create_window(
-            "FrFruit Studio Workstation",
-            url=base_url,
-            width=1500,
-            height=920,
-            min_size=(1080, 680),
-            background_color="#0e1013",
-        )
-        webview.start()
-        server.should_exit = True
-        return
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    # 2. Try native Edge/Chrome --app= desktop mode on Windows
-    proc = _launch_windows_edge_app(base_url)
-    if proc is not None:
-        try:
-            proc.wait()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            server.should_exit = True
-        return
-
-    # 3. Fallback: open browser tab and serve until Ctrl+C
-    webbrowser.open(base_url)
-    try:
-        while thread.is_alive():
-            time.sleep(0.4)
-    except KeyboardInterrupt:
-        server.should_exit = True
+    finally:
+        _cleanup_studio_session()
 
 
 def main(argv: Sequence[str] | None = None) -> None:

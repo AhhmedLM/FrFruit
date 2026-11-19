@@ -1569,7 +1569,7 @@ def create_studio_app(
             rot = (float(rot_raw[0]), float(rot_raw[1]), float(rot_raw[2]))
 
             with sess.lock:
-                sess.push_history(f"character_create:{spec.preset}")
+                sess.push_history(f"character_create:{spec.preset}", notify=False)
                 res = build_or_update_character(
                     sess.scene,
                     spec,
@@ -1623,7 +1623,7 @@ def create_studio_app(
                     m_data.update(body["materials"])
                     spec.materials = CharacterMaterialParams(**m_data)
 
-                sess.push_history(f"character_update:{obj.id}")
+                sess.push_history(f"character_update:{obj.id}", notify=False)
                 res = build_or_update_character(
                     sess.scene,
                     spec,

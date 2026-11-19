@@ -87,9 +87,10 @@ class FrFruitSession:
             raise ToolError(f"File not found: {candidate}")
         return candidate
 
-    def push_history(self, label: str) -> None:
+    def push_history(self, label: str, *, notify: bool = True) -> None:
         self.history.push(self.scene, label)
-        self.notify("scene_mutated", {"action": label})
+        if notify:
+            self.notify("scene_mutated", {"action": label})
 
     def require_object(self, id_or_name: str, expected_kind: str | None = None) -> SceneObject:
         obj = self.scene.resolve_object(id_or_name)

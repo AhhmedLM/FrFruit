@@ -19,8 +19,13 @@
     playTimer: null,
     ws: null,
     firstLoad: true,
+    refreshInFlight: false,
+    refreshPending: null,
     charPresets: null,
     charUpdateTimer: null,
+    charUpdateInFlight: false,
+    charUpdatePending: false,
+    charUpdatePendingMats: false,
   };
 
   const vp = new window.ViewportGL($("gl-canvas"));
@@ -103,12 +108,21 @@
   }
 
   async function refreshAll(autoFit = false) {
+    if (state.refreshInFlight) {
+      state.refreshPending = {
+        autoFit: Boolean(state.refreshPending && state.refreshPending.autoFit) || autoFit,
+      };
+      return;
+    }
+    state.refreshInFlight = true;
     try {
       const [st, geo] = await Promise.all([api("/api/state"), api("/api/geometry")]);
+      const hadMeshes = vp.meshes.length > 0;
+      const hasMeshes = (geo.meshes || []).length > 0;
       state.scene = st;
       renderStateUI(st);
       vp.selectedId = state.selectedId;
-      vp.setGeometry(geo, autoFit || state.firstLoad);
+      vp.setGeometry(geo, autoFit || state.firstLoad || (!hadMeshes && hasMeshes));
       state.firstLoad = false;
       if (state.editMode) {
         await syncEditElements();
@@ -118,6 +132,13 @@
       }
     } catch (err) {
       toast(err.message, "err");
+    } finally {
+      state.refreshInFlight = false;
+      if (state.refreshPending) {
+        const next = state.refreshPending;
+        state.refreshPending = null;
+        await refreshAll(next.autoFit);
+      }
     }
   }
 
@@ -1228,25 +1249,46 @@
     } catch (_) {}
   }
 
-  async function applyCharacterUpdate(includeMats = false) {
+  async function applyCharacterUpdate(includeMats = false, silent = false) {
     const obj = getActiveCharacterObj();
-    if (!obj) return toast("Select a procedural character first", "warn");
-    const sliders = collectCharSliders();
-    const payload = {
-      quality: $("char-quality").value,
-      pose: $("char-pose").value,
-      body: sliders.body,
-      face: sliders.face,
-      expressions: sliders.expressions,
-    };
-    if (includeMats) payload.materials = collectCharMaterials();
-    const res = await api(`/api/character/${encodeURIComponent(obj.id)}/update`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    updateCharAnthropometryBanner(res.anthropometry);
-    await refreshAll();
-    toast(`Updated character (${res.total_vertex_count || res.vertex_count}v)`, "ok");
+    if (!obj) {
+      if (!silent) toast("Select a procedural character first", "warn");
+      return;
+    }
+    if (state.charUpdateInFlight) {
+      state.charUpdatePending = true;
+      state.charUpdatePendingMats = state.charUpdatePendingMats || includeMats;
+      return;
+    }
+    state.charUpdateInFlight = true;
+    try {
+      const sliders = collectCharSliders();
+      const payload = {
+        quality: $("char-quality").value,
+        pose: $("char-pose").value,
+        body: sliders.body,
+        face: sliders.face,
+        expressions: sliders.expressions,
+      };
+      if (includeMats) payload.materials = collectCharMaterials();
+      const res = await api(`/api/character/${encodeURIComponent(obj.id)}/update`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      updateCharAnthropometryBanner(res.anthropometry);
+      await refreshAll();
+      if (!silent) {
+        toast(`Updated character (${res.total_vertex_count || res.vertex_count}v)`, "ok");
+      }
+    } finally {
+      state.charUpdateInFlight = false;
+      if (state.charUpdatePending) {
+        const nextMats = state.charUpdatePendingMats;
+        state.charUpdatePending = false;
+        state.charUpdatePendingMats = false;
+        applyCharacterUpdate(nextMats, true).catch((err) => toast(err.message, "err"));
+      }
+    }
   }
 
   function scheduleCharSliderUpdate() {
@@ -1254,8 +1296,8 @@
     if (!obj) return;
     if (state.charUpdateTimer) clearTimeout(state.charUpdateTimer);
     state.charUpdateTimer = setTimeout(() => {
-      applyCharacterUpdate(false).catch((err) => toast(err.message, "err"));
-    }, 320);
+      applyCharacterUpdate(false, true).catch((err) => toast(err.message, "err"));
+    }, 120);
   }
 
   document.querySelectorAll("[data-char-body]").forEach((el) => {

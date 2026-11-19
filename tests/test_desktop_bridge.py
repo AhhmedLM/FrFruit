@@ -350,3 +350,102 @@ def test_live_uvicorn_websocket_mcp_client_tracking_and_stdio_bridge(tmp_path: P
     finally:
         srv.should_exit = True
         thread.join(timeout=3.0)
+
+
+def test_studio_auto_discovery_helper(tmp_path: Path) -> None:
+    import threading
+
+    import uvicorn
+
+    from frfruit.desktop.win_shell import _find_free_port, _wait_ready
+    from frfruit.mcp_server.server import discover_running_studio_url
+
+    dead_file = tmp_path / "dead_studio.json"
+    dead_file.write_text(
+        json.dumps({"url": "http://127.0.0.1:59999/mcp", "base_url": "http://127.0.0.1:59999"}),
+        encoding="utf-8",
+    )
+    assert discover_running_studio_url(dead_file, timeout=0.2) is None
+
+    port = _find_free_port(preferred=0)
+    app, _sess, _mcp = create_studio_app(workspace_root=tmp_path, host="127.0.0.1", port=port)
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    srv = uvicorn.Server(config)
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+    try:
+        assert _wait_ready(f"http://127.0.0.1:{port}/api/mcp/info")
+        live_file = tmp_path / "live_studio.json"
+        live_file.write_text(
+            json.dumps(
+                {
+                    "url": f"http://127.0.0.1:{port}/mcp",
+                    "base_url": f"http://127.0.0.1:{port}",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert discover_running_studio_url(live_file, timeout=1.0) == f"http://127.0.0.1:{port}/mcp"
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=3.0)
+
+
+def test_mcp_character_create_updates_geometry_and_emits_after_build(tmp_path: Path) -> None:
+    import asyncio
+    import threading
+    import urllib.request
+
+    import uvicorn
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.types import Implementation
+
+    from frfruit.desktop.win_shell import _find_free_port, _wait_ready
+
+    port = _find_free_port(preferred=0)
+    app, sess, _mcp = create_studio_app(workspace_root=tmp_path, host="127.0.0.1", port=port)
+    seen_events: list[tuple[str, int]] = []
+    sess.add_listener(
+        lambda payload: seen_events.append((payload["event"], len(sess.scene.objects)))
+    )
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    srv = uvicorn.Server(config)
+    thread = threading.Thread(target=srv.run, daemon=True)
+    thread.start()
+
+    async def _run() -> None:
+        async with streamable_http_client(f"http://127.0.0.1:{port}/mcp") as (r, w, *_):
+            async with ClientSession(
+                r, w, client_info=Implementation(name="char-mcp-test", version="1.0")
+            ) as session:
+                await session.initialize()
+                await session.call_tool(
+                    "character_manage",
+                    {
+                        "action": "create",
+                        "preset": "realistic_male",
+                        "quality": "preview",
+                        "name": "McpHero",
+                    },
+                )
+
+    try:
+        assert _wait_ready(f"http://127.0.0.1:{port}/api/mcp/info")
+        asyncio.run(_run())
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/geometry") as resp:
+            geo = json.loads(resp.read())
+        mesh_names = {m["name"] for m in geo["meshes"]}
+        assert "McpHero" in mesh_names
+        assert len(geo["meshes"]) >= 5
+        for m in geo["meshes"]:
+            assert len(m["positions"]) > 0
+            assert len(m["indices"]) > 0
+
+        created_events = [cnt for ev, cnt in seen_events if ev == "character_created"]
+        assert created_events and created_events[-1] >= 5
+        assert not any(ev == "scene_mutated" for ev, _ in seen_events)
+    finally:
+        srv.should_exit = True
+        thread.join(timeout=3.0)

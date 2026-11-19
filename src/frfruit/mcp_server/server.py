@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -48,7 +50,7 @@ def create_server(workspace_root: str | Path | None = None) -> tuple[MCPServer, 
             "rigging, path-traced rendering, video/FBX export, and MCP engine."
         ),
         instructions=SERVER_INSTRUCTIONS,
-        version="0.2.0",
+        version="0.2.1",
     )
 
     def get_session() -> FrFruitSession:
@@ -101,6 +103,33 @@ def run_studio_stdio_bridge(studio_url: str) -> None:
     anyio.run(_bridge_stdio_to_studio, studio_url)
 
 
+def discover_running_studio_url(
+    session_file: Path | None = None,
+    timeout: float = 0.8,
+) -> str | None:
+    """Return the live Studio `/mcp` URL if a Studio instance is running locally."""
+    path = session_file or (Path.home() / ".frfruit" / "studio_session.json")
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        url = str(data.get("url") or "").strip()
+        base_url = str(data.get("base_url") or "").strip()
+        if not url:
+            return None
+        if not base_url:
+            base_url = url.removesuffix("/mcp").rstrip("/")
+        with urllib.request.urlopen(f"{base_url}/api/mcp/info", timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            info = json.loads(resp.read().decode("utf-8"))
+            if info.get("status") == "online":
+                return url
+    except Exception:
+        return None
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Entry point for `frfruit-mcp` over stdio (or bridged to live FrFruit Studio)."""
     parser = argparse.ArgumentParser(prog="frfruit-mcp", description="FrFruit MCP Server")
@@ -117,8 +146,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.workspace:
         default_session.set_workspace_root(args.workspace)
-    if args.studio_url:
-        run_studio_stdio_bridge(args.studio_url)
+    studio_url = args.studio_url or discover_running_studio_url()
+    if studio_url:
+        run_studio_stdio_bridge(studio_url)
     else:
         mcp.run(transport="stdio")
 
