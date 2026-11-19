@@ -27,6 +27,25 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from frfruit.animation.evaluator import apply_animation_frame
+from frfruit.character import (
+    CHARACTER_PRESETS,
+    SEMANTIC_RBF_ANCHORS,
+    SKIN_TONE_PRESETS,
+    BodySliders,
+    CharacterMaterialParams,
+    CharacterSurface,
+    ExpressionSliders,
+    FaceSliders,
+    add_rbf_sculpt_node,
+    apply_character_delta,
+    blend_characters,
+    build_or_update_character,
+    compute_character_delta,
+    extract_custom_morph_from_mesh_edit,
+    extract_rbf_delta_from_mesh_edit,
+    get_character_preset,
+)
+from frfruit.character.schema import FACE_REGION_FIELDS
 from frfruit.core.math3d import transform_points
 from frfruit.core.scene import (
     ClothSpec,
@@ -132,6 +151,7 @@ def _serialize_state(
                 "cloth": obj.cloth.model_dump() if obj.cloth else None,
                 "cloth_cached_frames": len(obj.vertex_cache),
                 "skin_armature_id": obj.skin.armature_id if obj.skin else None,
+                "character": obj.character.model_dump() if obj.character else None,
                 "bones": (
                     [b.model_dump() for b in obj.armature.bones]
                     if obj.armature is not None
@@ -196,6 +216,7 @@ def _material_to_gl_dict(mat: MaterialSpec | None) -> dict[str, Any]:
             "alpha": 1.0,
             "uv_scale": [1.0, 1.0],
             "has_albedo_map": False,
+            "albedo_sig": "",
         }
     return {
         "id": mat.id,
@@ -207,6 +228,7 @@ def _material_to_gl_dict(mat: MaterialSpec | None) -> dict[str, Any]:
         "alpha": float(mat.alpha),
         "uv_scale": [float(mat.uv_scale[0]), float(mat.uv_scale[1])],
         "has_albedo_map": bool(mat.albedo_map and Path(mat.albedo_map).is_file()),
+        "albedo_sig": Path(mat.albedo_map).name if mat.albedo_map else "",
     }
 
 
@@ -1497,6 +1519,347 @@ def create_studio_app(
         except (ToolError, Exception) as exc:
             return _error_json(str(exc), 404)
 
+    async def api_character_presets(_req: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "ok",
+                "presets": {k: v.model_dump() for k, v in CHARACTER_PRESETS.items()},
+                "expressions": list(ExpressionSliders.model_fields.keys()),
+                "semantic_rbf_regions": sorted(SEMANTIC_RBF_ANCHORS.keys()),
+                "skin_tone_presets": SKIN_TONE_PRESETS,
+                "delta_regions": list(FACE_REGION_FIELDS.keys()),
+            }
+        )
+
+    async def api_character_create(req: Request) -> JSONResponse:
+        body = await _json_body(req)
+        try:
+            preset = str(body.get("preset") or "realistic_neutral")
+            spec = get_character_preset(preset)
+            if body.get("quality") is not None:
+                spec.quality = str(body["quality"])  # type: ignore[assignment]
+            if body.get("pose") is not None:
+                spec.pose = str(body["pose"])  # type: ignore[assignment]
+            if body.get("auto_rig") is not None:
+                spec.auto_rig = bool(body["auto_rig"])
+            if isinstance(body.get("body"), dict):
+                b_data = spec.body.model_dump()
+                b_data.update(body["body"])
+                spec.body = BodySliders(**b_data)
+            if isinstance(body.get("face"), dict):
+                f_data = spec.face.model_dump()
+                f_data.update(body["face"])
+                spec.face = FaceSliders(**f_data)
+            if isinstance(body.get("expressions"), dict):
+                e_data = spec.expressions.model_dump()
+                e_data.update(body["expressions"])
+                spec.expressions = ExpressionSliders(**e_data)
+            if isinstance(body.get("custom_morphs"), dict):
+                for mk, mv in body["custom_morphs"].items():
+                    spec.custom_morphs[str(mk)] = float(mv)
+            if isinstance(body.get("materials"), dict):
+                m_data = spec.materials.model_dump()
+                m_data.update(body["materials"])
+                spec.materials = CharacterMaterialParams(**m_data)
+
+            name = str(body["name"]) if body.get("name") else None
+            loc_raw = body.get("location", [0.0, 0.0, 0.0])
+            rot_raw = body.get("rotation_deg", [0.0, 0.0, 0.0])
+            loc = (float(loc_raw[0]), float(loc_raw[1]), float(loc_raw[2]))
+            rot = (float(rot_raw[0]), float(rot_raw[1]), float(rot_raw[2]))
+
+            with sess.lock:
+                sess.push_history(f"character_create:{spec.preset}")
+                res = build_or_update_character(
+                    sess.scene,
+                    spec,
+                    name=name,
+                    location=loc,
+                    rotation_deg=rot,
+                    cache_root=sess.workspace_root,
+                )
+            sess.notify(
+                "character_created",
+                {"object_id": res["object_id"], "name": res["name"]},
+            )
+            return JSONResponse(res)
+        except Exception as exc:
+            return _error_json(str(exc))
+
+    async def api_character_update(req: Request) -> JSONResponse:
+        oid = req.path_params["object_id"]
+        body = await _json_body(req)
+        try:
+            with sess.lock:
+                obj = sess.require_object(oid)
+                if obj.character is None:
+                    return _error_json(
+                        f"Object {obj.name!r} is not a procedural Quad-Morph character."
+                    )
+                spec = obj.character.model_copy(deep=True)
+                if body.get("quality") is not None:
+                    spec.quality = str(body["quality"])  # type: ignore[assignment]
+                if body.get("pose") is not None:
+                    spec.pose = str(body["pose"])  # type: ignore[assignment]
+                if body.get("auto_rig") is not None:
+                    spec.auto_rig = bool(body["auto_rig"])
+                if isinstance(body.get("body"), dict):
+                    b_data = spec.body.model_dump()
+                    b_data.update(body["body"])
+                    spec.body = BodySliders(**b_data)
+                if isinstance(body.get("face"), dict):
+                    f_data = spec.face.model_dump()
+                    f_data.update(body["face"])
+                    spec.face = FaceSliders(**f_data)
+                if isinstance(body.get("expressions"), dict):
+                    e_data = spec.expressions.model_dump()
+                    e_data.update(body["expressions"])
+                    spec.expressions = ExpressionSliders(**e_data)
+                if isinstance(body.get("custom_morphs"), dict):
+                    for mk, mv in body["custom_morphs"].items():
+                        spec.custom_morphs[str(mk)] = float(mv)
+                if isinstance(body.get("materials"), dict):
+                    m_data = spec.materials.model_dump()
+                    m_data.update(body["materials"])
+                    spec.materials = CharacterMaterialParams(**m_data)
+
+                sess.push_history(f"character_update:{obj.id}")
+                res = build_or_update_character(
+                    sess.scene,
+                    spec,
+                    object_id=obj.id,
+                    cache_root=sess.workspace_root,
+                )
+            sess.notify("character_updated", {"object_id": obj.id})
+            return JSONResponse(res)
+        except (ToolError, Exception) as exc:
+            return _error_json(str(exc))
+
+    async def api_character_sculpt_rbf(req: Request) -> JSONResponse:
+        oid = req.path_params["object_id"]
+        body = await _json_body(req)
+        try:
+            with sess.lock:
+                obj = sess.require_object(oid)
+                if obj.character is None:
+                    return _error_json(
+                        f"Object {obj.name!r} is not a procedural Quad-Morph character."
+                    )
+                spec = obj.character.model_copy(deep=True)
+                if body.get("clear_rbf"):
+                    spec.rbf_nodes = []
+                node_info: dict[str, Any] | None = None
+                region = body.get("region")
+                center_raw = body.get("center")
+                if region is not None or center_raw is not None:
+                    center = (
+                        (float(center_raw[0]), float(center_raw[1]), float(center_raw[2]))
+                        if center_raw is not None
+                        else None
+                    )
+                    vec_raw = body.get("vector_delta", [0.0, 0.0, 0.0])
+                    vec_delta = (float(vec_raw[0]), float(vec_raw[1]), float(vec_raw[2]))
+                    spec, node = add_rbf_sculpt_node(
+                        spec,
+                        region=str(region or "custom"),
+                        center=center,
+                        radius=float(body["radius"]) if body.get("radius") is not None else None,
+                        weight=float(body.get("weight", 0.0)),
+                        vector_delta=vec_delta,
+                        mirror_x=body.get("mirror_x"),
+                    )
+                    node_info = node.model_dump()
+                elif not body.get("clear_rbf"):
+                    return _error_json("Specify region/center or clear_rbf=true.")
+
+                sess.push_history(f"character_sculpt_rbf:{obj.id}")
+                res = build_or_update_character(
+                    sess.scene,
+                    spec,
+                    object_id=obj.id,
+                    cache_root=sess.workspace_root,
+                )
+                res["added_node"] = node_info
+            sess.notify("character_updated", {"object_id": obj.id})
+            return JSONResponse(res)
+        except (ToolError, Exception) as exc:
+            return _error_json(str(exc))
+
+    async def api_character_blend_delta(req: Request) -> JSONResponse:
+        oid = req.path_params["object_id"]
+        body = await _json_body(req)
+        try:
+            source_id = body.get("source_id")
+            preset = body.get("preset")
+            region = str(body.get("region") or "all")
+            alpha = float(body.get("alpha", 0.5))
+            mode = str(body.get("mode") or "blend")
+            delta_name = str(body.get("delta_name") or "delta_1")
+
+            with sess.lock:
+                obj = sess.require_object(oid)
+                if obj.character is None:
+                    return _error_json(
+                        f"Object {obj.name!r} is not a procedural Quad-Morph character."
+                    )
+
+                src_spec = None
+                src_label = ""
+                if source_id:
+                    sobj = sess.scene.resolve_object(str(source_id))
+                    if sobj is not None and sobj.character is not None:
+                        src_spec = sobj.character
+                        src_label = sobj.name
+                    elif str(source_id).strip().lower() in CHARACTER_PRESETS:
+                        src_spec = get_character_preset(str(source_id))
+                        src_label = str(source_id)
+                if src_spec is None and preset:
+                    src_spec = get_character_preset(str(preset))
+                    src_label = str(preset)
+
+                if mode == "apply_delta":
+                    if delta_name in obj.character.stored_deltas and src_spec is None:
+                        delta = obj.character.stored_deltas[delta_name]
+                    elif src_spec is not None:
+                        base_spec = get_character_preset("realistic_neutral")
+                        delta = compute_character_delta(
+                            base_spec,
+                            src_spec,
+                            region=region,  # type: ignore[arg-type]
+                            name=delta_name,
+                            source_a_name="realistic_neutral",
+                            source_b_name=src_label,
+                        )
+                    else:
+                        return _error_json("Provide source_id, preset, or a stored delta_name.")
+                    updated = apply_character_delta(
+                        obj.character,
+                        delta,
+                        weight=alpha,
+                        region=region,  # type: ignore[arg-type]
+                    )
+                else:
+                    if src_spec is None:
+                        return _error_json("Provide source_id or preset for blending.")
+                    updated = blend_characters(
+                        obj.character,
+                        src_spec,
+                        alpha=alpha,
+                        region=region,  # type: ignore[arg-type]
+                    )
+
+                sess.push_history(f"character_blend_delta:{obj.id}")
+                res = build_or_update_character(
+                    sess.scene,
+                    updated,
+                    object_id=obj.id,
+                    cache_root=sess.workspace_root,
+                )
+                res["mode"] = mode
+                res["region"] = region
+                res["alpha"] = alpha
+            sess.notify("character_updated", {"object_id": obj.id})
+            return JSONResponse(res)
+        except (ToolError, Exception) as exc:
+            return _error_json(str(exc))
+
+    async def api_character_extract_edit_delta(req: Request) -> JSONResponse:
+        oid = req.path_params["object_id"]
+        body = await _json_body(req)
+        try:
+            region_name = str(body.get("region") or "mesh_edit")
+            with sess.lock:
+                obj = sess.require_object(oid)
+                if obj.character is None or obj.mesh is None:
+                    return _error_json(
+                        f"Object {obj.name!r} is not an active Quad-Morph character mesh."
+                    )
+                edited_mesh = MeshData.from_payload(obj.mesh)
+                surface = CharacterSurface(obj.character, quality=obj.character.quality)
+                orig_mesh = surface.skin_mesh
+                if len(orig_mesh.vertices) != len(edited_mesh.vertices):
+                    return _error_json(
+                        f"Mesh topology changed ({len(orig_mesh.vertices)} -> "
+                        f"{len(edited_mesh.vertices)} vertices). Only non-topological edits "
+                        "can be extracted to RBF deltas."
+                    )
+                nodes = extract_rbf_delta_from_mesh_edit(
+                    orig_mesh,
+                    edited_mesh,
+                    surface.lm,
+                    region_name=region_name,
+                )
+                if not nodes:
+                    return JSONResponse(
+                        {
+                            "status": "ok",
+                            "object_id": obj.id,
+                            "extracted_nodes": 0,
+                            "message": "No significant vertex displacements detected.",
+                        }
+                    )
+                spec = obj.character.model_copy(deep=True)
+                spec.rbf_nodes.extend(nodes)
+                sess.push_history(f"character_extract_edit_delta:{obj.id}")
+                res = build_or_update_character(
+                    sess.scene,
+                    spec,
+                    object_id=obj.id,
+                    cache_root=sess.workspace_root,
+                )
+                res["extracted_nodes"] = len(nodes)
+                res["nodes"] = [n.model_dump() for n in nodes]
+            sess.notify("character_updated", {"object_id": obj.id})
+            return JSONResponse(res)
+        except (ToolError, Exception) as exc:
+            return _error_json(str(exc))
+
+    async def api_character_save_morph(req: Request) -> JSONResponse:
+        oid = req.path_params["object_id"]
+        body = await _json_body(req)
+        try:
+            morph_name = str(body.get("morph_name") or "custom_morph_1")
+            region = str(body.get("region") or "all")
+            with sess.lock:
+                obj = sess.require_object(oid)
+                if obj.character is None or obj.mesh is None:
+                    return _error_json(
+                        f"Object {obj.name!r} is not an active Quad-Morph character mesh."
+                    )
+                edited_mesh = MeshData.from_payload(obj.mesh)
+                morph = extract_custom_morph_from_mesh_edit(
+                    obj.character,
+                    edited_mesh,
+                    morph_name=morph_name,
+                    region=region,
+                )
+                if not morph.deltas:
+                    return JSONResponse(
+                        {
+                            "status": "ok",
+                            "object_id": obj.id,
+                            "morph_name": morph.name,
+                            "active_vertices": 0,
+                            "message": "No significant base-cage displacements detected.",
+                        }
+                    )
+                spec = obj.character.model_copy(deep=True)
+                spec.stored_morphs[morph.name] = morph
+                spec.custom_morphs[morph.name] = 1.0
+                sess.push_history(f"character_save_morph:{obj.id}:{morph.name}")
+                res = build_or_update_character(
+                    sess.scene,
+                    spec,
+                    object_id=obj.id,
+                    cache_root=sess.workspace_root,
+                )
+                res["saved_morph"] = morph.name
+                res["active_vertices"] = len(morph.deltas)
+            sess.notify("character_updated", {"object_id": obj.id})
+            return JSONResponse(res)
+        except (ToolError, Exception) as exc:
+            return _error_json(str(exc))
+
     async def api_mcp_info(_req: Request) -> JSONResponse:
         base_url = f"http://{host}:{port}"
         ws_url = f"ws://{host}:{port}/ws/events"
@@ -1624,6 +1987,23 @@ def create_studio_app(
         Route("/api/export", api_export, methods=["POST"]),
         Route("/api/video/render", api_video_render, methods=["POST"]),
         Route("/api/files/download", api_file_download, methods=["GET"]),
+        Route("/api/character/presets", api_character_presets, methods=["GET"]),
+        Route("/api/character/create", api_character_create, methods=["POST"]),
+        Route("/api/character/{object_id}/update", api_character_update, methods=["POST"]),
+        Route("/api/character/{object_id}/sculpt_rbf", api_character_sculpt_rbf, methods=["POST"]),
+        Route(
+            "/api/character/{object_id}/blend_delta", api_character_blend_delta, methods=["POST"]
+        ),
+        Route(
+            "/api/character/{object_id}/extract_edit_delta",
+            api_character_extract_edit_delta,
+            methods=["POST"],
+        ),
+        Route(
+            "/api/character/{object_id}/save_morph",
+            api_character_save_morph,
+            methods=["POST"],
+        ),
         Route("/api/mcp/info", api_mcp_info, methods=["GET"]),
         WebSocketRoute("/ws/events", ws_events),
     ]

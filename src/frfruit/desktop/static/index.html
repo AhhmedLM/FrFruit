@@ -156,6 +156,7 @@
       <aside id="right-dock" class="dock">
         <div class="tab-bar" id="inspector-tabs">
           <button class="tab-btn active" data-tab="prop">Prop</button>
+          <button class="tab-btn" data-tab="char">Char</button>
           <button class="tab-btn" data-tab="edit">Edit</button>
           <button class="tab-btn" data-tab="tex">Tex</button>
           <button class="tab-btn" data-tab="phys">Phys</button>
@@ -224,6 +225,280 @@
                   <span class="prop-label">Dimensions</span>
                   <span class="mono" id="prop-dims-lbl">-</span>
                 </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 2: PROCEDURAL REALISTIC QUAD-MORPH HUMAN CHARACTER DESIGNER -->
+          <div class="tab-pane" id="tab-char">
+            <div class="section-card">
+              <div class="section-title">
+                <span>Realistic Character (Quad-Morph)</span>
+                <span class="mono" id="char-active-badge">NO CHAR</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Preset</span>
+                <select id="char-preset">
+                  <option value="realistic_neutral">Realistic Neutral (7.40 HU)</option>
+                  <option value="realistic_male">Realistic Male</option>
+                  <option value="realistic_female">Realistic Female</option>
+                  <option value="realistic_athletic">Realistic Athletic</option>
+                  <option value="elder_portrait">Elder Portrait</option>
+                </select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Quality / Pose</span>
+                <div class="vec3-grid" style="grid-template-columns:1fr 1fr">
+                  <select id="char-quality">
+                    <option value="preview">Preview (Fast)</option>
+                    <option value="medium" selected>Medium (Balanced)</option>
+                    <option value="high">High (Portrait)</option>
+                  </select>
+                  <select id="char-pose">
+                    <option value="a_pose" selected>A-Pose</option>
+                    <option value="t_pose">T-Pose</option>
+                    <option value="relaxed">Relaxed</option>
+                  </select>
+                </div>
+              </div>
+              <div class="btn-row" style="margin-top:6px">
+                <button id="btn-char-create" class="primary">+ Create Character</button>
+                <button id="btn-char-rebuild">Apply &amp; Rebuild</button>
+              </div>
+              <div class="result-banner" id="char-anthro-lbl" style="margin-top:6px">
+                Head Units: - | Thirds: - | Eye Ratio: -
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">
+                <span>Body Anthropometry</span>
+                <span class="mono" id="char-hu-badge">7.40 HU</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Gender (F/M)</span>
+                <input type="range" id="cs-gender" data-char-body="gender" min="-1" max="1" step="0.05" value="0" />
+                <span class="slider-val" id="cs-gender-v">0.00</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Height (m)</span>
+                <input type="range" id="cs-height" data-char-body="height" min="1.45" max="2.10" step="0.01" value="1.74" />
+                <span class="slider-val" id="cs-height-v">1.74</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Muscularity</span>
+                <input type="range" id="cs-muscularity" data-char-body="muscularity" min="0" max="1" step="0.02" value="0.38" />
+                <span class="slider-val" id="cs-muscularity-v">0.38</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Body Fat</span>
+                <input type="range" id="cs-body_fat" data-char-body="body_fat" min="0" max="1" step="0.02" value="0.22" />
+                <span class="slider-val" id="cs-body_fat-v">0.22</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Age</span>
+                <input type="range" id="cs-age" data-char-body="age" min="0" max="1" step="0.02" value="0.28" />
+                <span class="slider-val" id="cs-age-v">0.28</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Head Scale</span>
+                <input type="range" id="cs-head_scale" data-char-body="head_scale" min="0.85" max="1.18" step="0.01" value="1.0" />
+                <span class="slider-val" id="cs-head_scale-v">1.00</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Shoulders</span>
+                <input type="range" id="cs-shoulder_width" data-char-body="shoulder_width" min="0.78" max="1.30" step="0.02" value="1.0" />
+                <span class="slider-val" id="cs-shoulder_width-v">1.00</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Hip Width</span>
+                <input type="range" id="cs-hip_width" data-char-body="hip_width" min="0.78" max="1.30" step="0.02" value="1.0" />
+                <span class="slider-val" id="cs-hip_width-v">1.00</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Limb Thick</span>
+                <input type="range" id="cs-limb_thickness" data-char-body="limb_thickness" min="0.75" max="1.35" step="0.02" value="1.0" />
+                <span class="slider-val" id="cs-limb_thickness-v">1.00</span>
+              </div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">
+                <span>Facial Expressions (Shape Keys)</span>
+              </div>
+              <div class="slider-row"><span class="prop-label">Smile</span><input type="range" id="ce-smile" data-char-expr="smile" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="ce-smile-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Blink Left</span><input type="range" id="ce-blink_left" data-char-expr="blink_left" min="0" max="1" step="0.05" value="0" /><span class="slider-val" id="ce-blink_left-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Blink Right</span><input type="range" id="ce-blink_right" data-char-expr="blink_right" min="0" max="1" step="0.05" value="0" /><span class="slider-val" id="ce-blink_right-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Brow Raise</span><input type="range" id="ce-brow_raise" data-char-expr="brow_raise" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="ce-brow_raise-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Jaw Open</span><input type="range" id="ce-jaw_open" data-char-expr="jaw_open" min="0" max="1" step="0.05" value="0" /><span class="slider-val" id="ce-jaw_open-v">0.00</span></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">
+                <span>Facial Anthropometry Sliders</span>
+                <button id="btn-char-apply-sliders" style="height:20px;padding:0 7px;font-size:10px" class="primary">Apply</button>
+              </div>
+              <div class="slider-row"><span class="prop-label">Face Width</span><input type="range" id="cf-face_width" data-char-face="face_width" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-face_width-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Jaw Width</span><input type="range" id="cf-jaw_width" data-char-face="jaw_width" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-jaw_width-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Jaw Angle</span><input type="range" id="cf-jaw_angle" data-char-face="jaw_angle" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-jaw_angle-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Chin Prom.</span><input type="range" id="cf-chin_prominence" data-char-face="chin_prominence" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-chin_prominence-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Cheekbones</span><input type="range" id="cf-cheekbone_prominence" data-char-face="cheekbone_prominence" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-cheekbone_prominence-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Brow Ridge</span><input type="range" id="cf-brow_ridge" data-char-face="brow_ridge" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-brow_ridge-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Eye Size</span><input type="range" id="cf-eye_size" data-char-face="eye_size" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-eye_size-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Eye Spacing</span><input type="range" id="cf-eye_spacing" data-char-face="eye_spacing" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-eye_spacing-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Eye Height</span><input type="range" id="cf-eye_height" data-char-face="eye_height" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-eye_height-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Nose Length</span><input type="range" id="cf-nose_length" data-char-face="nose_length" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-nose_length-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Nose Width</span><input type="range" id="cf-nose_width" data-char-face="nose_width" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-nose_width-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Nose Bridge</span><input type="range" id="cf-nose_bridge" data-char-face="nose_bridge" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-nose_bridge-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Nose Tip</span><input type="range" id="cf-nose_tip_projection" data-char-face="nose_tip_projection" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-nose_tip_projection-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Mouth Width</span><input type="range" id="cf-mouth_width" data-char-face="mouth_width" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-mouth_width-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Upper Lip</span><input type="range" id="cf-upper_lip_fullness" data-char-face="upper_lip_fullness" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-upper_lip_fullness-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Lower Lip</span><input type="range" id="cf-lower_lip_fullness" data-char-face="lower_lip_fullness" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-lower_lip_fullness-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Rest Smile</span><input type="range" id="cf-smile" data-char-face="smile" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-smile-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Ear Size</span><input type="range" id="cf-ear_size" data-char-face="ear_size" min="-1" max="1" step="0.05" value="0" /><span class="slider-val" id="cf-ear_size-v">0.00</span></div>
+              <div class="slider-row"><span class="prop-label">Pore Detail</span><input type="range" id="cf-pore_detail" data-char-face="pore_detail" min="0" max="1" step="0.05" value="0.65" /><span class="slider-val" id="cf-pore_detail-v">0.65</span></div>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Skin, Eyes &amp; Hair Materials</div>
+              <div class="prop-row">
+                <span class="prop-label">Skin Preset</span>
+                <select id="char-skin-preset">
+                  <option value="">Custom RGB</option>
+                  <option value="fair">Fair</option>
+                  <option value="medium_warm">Medium Warm</option>
+                  <option value="olive">Olive</option>
+                  <option value="tan">Tan</option>
+                  <option value="brown">Brown</option>
+                  <option value="deep">Deep</option>
+                </select>
+              </div>
+              <div class="char-color-grid">
+                <div class="char-color-cell"><span>Skin</span><input type="color" id="cm-skin" value="#c79173" /></div>
+                <div class="char-color-cell"><span>Eyes</span><input type="color" id="cm-eye" value="#3d6b8f" /></div>
+                <div class="char-color-cell"><span>Lips</span><input type="color" id="cm-lip" value="#a34d47" /></div>
+                <div class="char-color-cell"><span>Hair</span><input type="color" id="cm-hair" value="#24170f" /></div>
+                <div class="char-color-cell"><span>Top</span><input type="color" id="cm-top" value="#2e4d75" /></div>
+                <div class="char-color-cell"><span>Bottom</span><input type="color" id="cm-bottom" value="#212636" /></div>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Hair Style</span>
+                <select id="cm-hair-style">
+                  <option value="short">Short Layered</option>
+                  <option value="swept">Swept Volume</option>
+                  <option value="bob">Layered Bob</option>
+                  <option value="long_wavy">Long Wavy</option>
+                  <option value="none">Bald / None</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Hair Length</span>
+                <input type="range" id="cm-hair-length" min="0.35" max="2.0" step="0.05" value="1.00" />
+                <span class="slider-val" id="cm-hair-length-v">1.00</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Hair Volume</span>
+                <input type="range" id="cm-hair-volume" min="0.40" max="1.8" step="0.05" value="1.00" />
+                <span class="slider-val" id="cm-hair-volume-v">1.00</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Hair Curl</span>
+                <input type="range" id="cm-hair-curl" min="0" max="1" step="0.05" value="0.15" />
+                <span class="slider-val" id="cm-hair-curl-v">0.15</span>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Hair Part</span>
+                <input type="range" id="cm-hair-part" min="-1" max="1" step="0.05" value="0.25" />
+                <span class="slider-val" id="cm-hair-part-v">0.25</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Clothing</span>
+                <select id="cm-clothing-style">
+                  <option value="casual">Casual (Tee + Pants)</option>
+                  <option value="tunic">Tunic (Long + Pants)</option>
+                  <option value="athletic">Athletic (Tank + Shorts)</option>
+                  <option value="none">None (Anatomy Base)</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Subsurface</span>
+                <input type="range" id="cm-sss" min="0" max="1" step="0.05" value="0.55" />
+                <span class="slider-val" id="cm-sss-v">0.55</span>
+              </div>
+              <button id="btn-char-apply-mats" style="width:100%;margin-top:4px">Apply Character Materials</button>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">
+                <span>RBF Sculpt &amp; Edit Extract</span>
+                <span class="mono" id="char-rbf-count">0 NODES</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Region</span>
+                <select id="crbf-region">
+                  <option value="nose_tip">Nose Tip</option>
+                  <option value="nose_bridge">Nose Bridge</option>
+                  <option value="cheekbone">Cheekbone</option>
+                  <option value="cheek">Cheek</option>
+                  <option value="jaw_corner">Jaw Corner</option>
+                  <option value="chin">Chin</option>
+                  <option value="brow">Brow Ridge</option>
+                  <option value="forehead">Forehead</option>
+                  <option value="upper_lip">Upper Lip</option>
+                  <option value="lower_lip">Lower Lip</option>
+                  <option value="ear">Ear</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Sculpt Weight</span>
+                <input type="range" id="crbf-weight" min="-0.25" max="0.25" step="0.01" value="-0.04" />
+                <span class="slider-val" id="crbf-weight-v">-0.04</span>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Radius / Mirror</span>
+                <div class="vec3-grid" style="grid-template-columns:1fr 1fr">
+                  <input type="number" id="crbf-radius" value="0.30" step="0.02" min="0.05" max="1.2" />
+                  <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-secondary)">
+                    <input type="checkbox" id="crbf-mirror" checked /> Mirror X
+                  </label>
+                </div>
+              </div>
+              <div class="btn-row" style="margin-top:6px">
+                <button id="btn-char-sculpt" class="primary">Apply RBF Sculpt</button>
+                <button id="btn-char-clear-rbf">Clear RBF</button>
+              </div>
+              <button id="btn-char-extract-delta" style="width:100%;margin-top:6px">Extract Mesh Edit -&gt; RBF Delta</button>
+            </div>
+
+            <div class="section-card">
+              <div class="section-title">Character Delta Blending (الفارق)</div>
+              <div class="prop-row">
+                <span class="prop-label">Source</span>
+                <select id="cdelta-source"></select>
+              </div>
+              <div class="prop-row">
+                <span class="prop-label">Region</span>
+                <select id="cdelta-region">
+                  <option value="all">All (Body + Face)</option>
+                  <option value="face">Full Face</option>
+                  <option value="body">Body Only</option>
+                  <option value="expressions">Expressions</option>
+                  <option value="upper_face">Upper Face</option>
+                  <option value="eyes">Eyes &amp; Brow</option>
+                  <option value="nose">Nose</option>
+                  <option value="mouth">Mouth &amp; Lips</option>
+                  <option value="jaw">Jaw &amp; Cheeks</option>
+                  <option value="ears">Ears</option>
+                </select>
+              </div>
+              <div class="slider-row">
+                <span class="prop-label">Alpha (Weight)</span>
+                <input type="range" id="cdelta-alpha" min="-1.0" max="2.0" step="0.05" value="0.50" />
+                <span class="slider-val" id="cdelta-alpha-v">0.50</span>
+              </div>
+              <div class="btn-row" style="margin-top:6px">
+                <button id="btn-char-blend" class="primary">Blend Toward Source</button>
+                <button id="btn-char-apply-delta">Apply Delta (الفارق)</button>
               </div>
             </div>
           </div>
@@ -636,7 +911,7 @@
             <div class="section-card">
               <div class="section-title">
                 <span>MCP Bridge Endpoints</span>
-                <span class="mono" id="mcp-tools-badge">34 TOOLS</span>
+                <span class="mono" id="mcp-tools-badge">35 TOOLS</span>
               </div>
               <div class="prop-row">
                 <span class="prop-label">HTTP (Stream)</span>

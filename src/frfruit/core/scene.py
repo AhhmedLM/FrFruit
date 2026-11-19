@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 from frfruit.animation.timeline import TimelineState
+from frfruit.character.schema import CharacterSpec
 from frfruit.core.types import ColorRGB, ColorRGBA, MeshPayload, Transform, Vec2, Vec3
 from frfruit.procedural.schema import ProceduralGraph
 
@@ -326,6 +327,7 @@ class SceneObject(BaseModel):
     cloth: ClothSpec | None = None
     armature: ArmatureSpec | None = None
     skin: SkinWeightSpec | None = None
+    character: CharacterSpec | None = None
     vertex_cache: dict[int, list[list[float]]] = Field(default_factory=dict)
 
 

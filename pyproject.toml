@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "frfruit"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-first headless 3D modeling, procedural generation, animation, and rendering engine exposed via MCP"
 readme = "README.md"
 requires-python = ">=3.11"

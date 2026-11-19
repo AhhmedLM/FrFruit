@@ -25,7 +25,7 @@ def test_desktop_api_websocket_and_cohosted_mcp_bridge(tmp_path: Path) -> None:
         assert demo.status_code == 200
         st = client.get("/api/state").json()
         assert st["scene_name"] == "PBRMaterialsShowcase"
-        assert st["mcp_tools_count"] == 34
+        assert st["mcp_tools_count"] == 35
 
         geo = client.get("/api/geometry").json()
         assert len(geo["meshes"]) >= 3
@@ -86,7 +86,7 @@ def test_desktop_api_websocket_and_cohosted_mcp_bridge(tmp_path: Path) -> None:
 
         # 6. Live MCP Info & Co-Hosted Streamable HTTP /mcp initialize handshake
         mcp_info = client.get("/api/mcp/info").json()
-        assert mcp_info["tools_count"] == 34
+        assert mcp_info["tools_count"] == 35
         assert mcp_info["streamable_http_url"] == "http://127.0.0.1:8765/mcp"
 
         init_req = {

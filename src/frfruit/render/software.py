@@ -636,7 +636,7 @@ class SoftwareRenderer:
                     ):
                         lights.append((lobj, lobj.light))
 
-                # Optional directional sun shadow map with tight bounds & 4-tap PCF
+                # Optional directional sun shadow map with tight visible-frustum bounds & soft PCF
                 sun_shadow_factor = np.ones((n_px, 1), dtype=np.float64)
                 if cfg.enable_shadows and cfg.mode == "pbr" and len(verts_w) > 0:
                     sun_lights = [lp for lp in lights if lp[1].kind == "sun" and lp[1].cast_shadows]
@@ -647,15 +647,24 @@ class SoftwareRenderer:
                         )
                         s_dir /= max(1e-9, float(np.linalg.norm(s_dir)))
                         s_bounds = compute_scene_bounds(evaluated)
-                        s_center = np.asarray(s_bounds.center, dtype=np.float64)
-                        s_half = max(0.8, 0.65 * float(np.linalg.norm(s_bounds.size)))
-                        s_eye = s_center - s_dir * (s_half * 3.0)
+                        scene_rad = max(0.5, 0.60 * float(np.linalg.norm(s_bounds.size)))
+
+                        # Fit XY shadow extent tightly around visible hit pixels
+                        vis_min = np.min(pos_w, axis=0)
+                        vis_max = np.max(pos_w, axis=0)
+                        vis_c = 0.5 * (vis_min + vis_max)
+                        vis_half = max(0.18, 0.62 * float(np.linalg.norm(vis_max - vis_min)))
+                        s_half = min(scene_rad * 1.15, vis_half)
+
+                        # Keep full scene Z span so off-screen casters still cast shadows
+                        z_span = max(scene_rad * 2.4, s_half * 2.4)
+                        s_eye = vis_c - s_dir * (z_span * 1.35)
                         s_view = look_at_matrix(
                             (float(s_eye[0]), float(s_eye[1]), float(s_eye[2])),
-                            (float(s_center[0]), float(s_center[1]), float(s_center[2])),
+                            (float(vis_c[0]), float(vis_c[1]), float(vis_c[2])),
                         )
-                        s_proj = orthographic_matrix(s_half * 2.2, 1.0, 0.1, s_half * 7.0)
-                        sz_res = 512
+                        s_proj = orthographic_matrix(s_half * 2.15, 1.0, 0.05, z_span * 3.0)
+                        sz_res = 768
                         sz_buf, _, _, _, _ = _rasterize_gbuffer(
                             verts_w, faces_w, s_view, s_proj, sz_res, sz_res, cull_backfaces=False
                         )
@@ -666,20 +675,41 @@ class SoftwareRenderer:
                         sx_base = np.floor(sx_f).astype(np.int32)
                         sy_base = np.floor(sy_f).astype(np.int32)
                         in_sm = (
-                            (sx_base >= 0)
-                            & (sx_base < sz_res - 1)
-                            & (sy_base >= 0)
-                            & (sy_base < sz_res - 1)
+                            (sx_base >= 1)
+                            & (sx_base < sz_res - 2)
+                            & (sy_base >= 1)
+                            & (sy_base < sz_res - 2)
                         )
                         idx_sm = np.nonzero(in_sm)[0]
-                        depth_bias = 0.012
+                        depth_bias = 0.0085
                         if len(idx_sm) > 0:
                             z_cmp = p_clip[idx_sm, 2] - depth_bias
+                            fx = np.clip(sx_f[idx_sm] - sx_base[idx_sm], 0.0, 1.0)
+                            fy = np.clip(sy_f[idx_sm] - sy_base[idx_sm], 0.0, 1.0)
+                            sbx = sx_base[idx_sm]
+                            sby = sy_base[idx_sm]
+
+                            # Smooth bilinear 3x3 tent-weighted PCF (zero blocky shadow edges!)
                             occ = np.zeros((len(idx_sm),), dtype=np.float64)
-                            for ox, oy in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                                sz_sample = sz_buf[sy_base[idx_sm] + oy, sx_base[idx_sm] + ox]
-                                occ += (z_cmp > sz_sample).astype(np.float64)
-                            sun_shadow_factor[idx_sm, 0] = 1.0 - 0.72 * (occ * 0.25)
+                            w_sum = 0.0
+                            for oy_k, wy_k in ((-1, 0.25), (0, 0.50), (1, 0.25)):
+                                for ox_k, wx_k in ((-1, 0.25), (0, 0.50), (1, 0.25)):
+                                    wk = wx_k * wy_k
+                                    w_sum += wk
+                                    bx = sbx + ox_k
+                                    by = sby + oy_k
+                                    o00 = (z_cmp > sz_buf[by, bx]).astype(np.float64)
+                                    o10 = (z_cmp > sz_buf[by, bx + 1]).astype(np.float64)
+                                    o01 = (z_cmp > sz_buf[by + 1, bx]).astype(np.float64)
+                                    o11 = (z_cmp > sz_buf[by + 1, bx + 1]).astype(np.float64)
+                                    ob = (
+                                        o00 * (1.0 - fx) * (1.0 - fy)
+                                        + o10 * fx * (1.0 - fy)
+                                        + o01 * (1.0 - fx) * fy
+                                        + o11 * fx * fy
+                                    )
+                                    occ += wk * ob
+                            sun_shadow_factor[idx_sm, 0] = 1.0 - 0.68 * (occ / w_sum)
 
                 # Hemisphere ambient lighting + sky/HDRI-driven IBL reflections
                 if scene.world.sky_mode == "gradient":

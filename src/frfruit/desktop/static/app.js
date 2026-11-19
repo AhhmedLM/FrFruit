@@ -19,6 +19,8 @@
     playTimer: null,
     ws: null,
     firstLoad: true,
+    charPresets: null,
+    charUpdateTimer: null,
   };
 
   const vp = new window.ViewportGL($("gl-canvas"));
@@ -257,6 +259,12 @@
         t.textContent = "RB";
         main.appendChild(t);
       }
+      if (obj.character) {
+        const t = document.createElement("span");
+        t.className = "tag-mini rig";
+        t.textContent = "CHR";
+        main.appendChild(t);
+      }
       if (obj.skin_armature_id) {
         const t = document.createElement("span");
         t.className = "tag-mini rig";
@@ -289,6 +297,7 @@
 
   function renderSelectedInspector(st) {
     const obj = st.objects.find((o) => o.id === state.selectedId);
+    renderCharacterInspector(st, obj);
     if (!obj) {
       $("no-selection-msg").style.display = "block";
       $("prop-editor").style.display = "none";
@@ -1014,6 +1023,390 @@
     };
   });
 
+  // ---- Procedural SDF Character Designer Controller ----
+  function rgbToHex(rgb) {
+    if (!Array.isArray(rgb) || rgb.length < 3) return "#808080";
+    return (
+      "#" +
+      [0, 1, 2]
+        .map((i) => Math.max(0, Math.min(255, Math.round(rgb[i] * 255))).toString(16).padStart(2, "0"))
+        .join("")
+    );
+  }
+
+  function hexToRgb(hex) {
+    const clean = (hex || "#808080").replace("#", "");
+    return [
+      parseInt(clean.slice(0, 2), 16) / 255.0,
+      parseInt(clean.slice(2, 4), 16) / 255.0,
+      parseInt(clean.slice(4, 6), 16) / 255.0,
+    ];
+  }
+
+  function collectCharSliders() {
+    const body = {};
+    document.querySelectorAll("[data-char-body]").forEach((el) => {
+      body[el.dataset.charBody] = parseFloat(el.value);
+    });
+    const face = {};
+    document.querySelectorAll("[data-char-face]").forEach((el) => {
+      face[el.dataset.charFace] = parseFloat(el.value);
+    });
+    const expressions = {};
+    document.querySelectorAll("[data-char-expr]").forEach((el) => {
+      expressions[el.dataset.charExpr] = parseFloat(el.value);
+    });
+    return { body, face, expressions };
+  }
+
+  function getActiveCharacterObj(st = state.scene, obj = null) {
+    const cur = obj || (st && st.objects && st.objects.find((o) => o.id === state.selectedId));
+    if (!cur) return null;
+    if (cur.character) return cur;
+    if (cur.parent_id && st && st.objects) {
+      const parent = st.objects.find((o) => o.id === cur.parent_id);
+      if (parent && parent.character) return parent;
+    }
+    return null;
+  }
+
+  function collectCharMaterials() {
+    return {
+      skin_tone: hexToRgb($("cm-skin").value),
+      eye_color: hexToRgb($("cm-eye").value),
+      lip_tint: hexToRgb($("cm-lip").value),
+      hair_color: hexToRgb($("cm-hair").value),
+      hair_style: $("cm-hair-style").value,
+      hair_length: parseFloat($("cm-hair-length").value),
+      hair_volume: parseFloat($("cm-hair-volume").value),
+      hair_curl: parseFloat($("cm-hair-curl").value),
+      hair_part: parseFloat($("cm-hair-part").value),
+      clothing_style: $("cm-clothing-style").value,
+      top_color: hexToRgb($("cm-top").value),
+      bottom_color: hexToRgb($("cm-bottom").value),
+      subsurface_strength: parseFloat($("cm-sss").value),
+    };
+  }
+
+  function updateCharAnthropometryBanner(anthro) {
+    if (!anthro) return;
+    $("char-hu-badge").textContent = `${Number(anthro.head_units).toFixed(2)} HU`;
+    const t = Array.isArray(anthro.facial_thirds)
+      ? anthro.facial_thirds.map((v) => Number(v).toFixed(2)).join("/")
+      : "-";
+    const er = anthro.eye_to_face_width_ratio != null ? Number(anthro.eye_to_face_width_ratio).toFixed(3) : "-";
+    $("char-anthro-lbl").textContent = `Head Units: ${Number(anthro.head_units).toFixed(2)} | Thirds: ${t} | Eye Ratio: ${er}`;
+  }
+
+  function populateDeltaSourceSelect(st) {
+    const sel = $("cdelta-source");
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = "";
+    const grpP = document.createElement("optgroup");
+    grpP.label = "Built-in Presets";
+    const presetNames = state.charPresets
+      ? Object.keys(state.charPresets.presets || {})
+      : [
+          "realistic_neutral",
+          "realistic_male",
+          "realistic_female",
+          "realistic_athletic",
+          "elder_portrait",
+        ];
+    for (const p of presetNames) {
+      const o = document.createElement("option");
+      o.value = `preset:${p}`;
+      o.textContent = `Preset: ${p}`;
+      grpP.appendChild(o);
+    }
+    sel.appendChild(grpP);
+
+    const activeChar = getActiveCharacterObj(st);
+    const activeId = activeChar ? activeChar.id : state.selectedId;
+    if (st && Array.isArray(st.objects)) {
+      const chars = st.objects.filter((o) => o.character && o.id !== activeId);
+      if (chars.length) {
+        const grpO = document.createElement("optgroup");
+        grpO.label = "Scene Characters";
+        for (const c of chars) {
+          const o = document.createElement("option");
+          o.value = `obj:${c.id}`;
+          o.textContent = `Scene: ${c.name}`;
+          grpO.appendChild(o);
+        }
+        sel.appendChild(grpO);
+      }
+    }
+    if (prev && Array.from(sel.options).some((o) => o.value === prev)) {
+      sel.value = prev;
+    } else if (sel.options.length > 2) {
+      sel.value = "preset:realistic_female";
+    }
+  }
+
+  function renderCharacterInspector(st, obj) {
+    populateDeltaSourceSelect(st);
+    const charObj = getActiveCharacterObj(st, obj);
+    const ch = charObj && charObj.character;
+    if (!ch) {
+      $("char-active-badge").textContent = "NO CHAR";
+      $("char-rbf-count").textContent = "0 NODES";
+      return;
+    }
+    $("char-active-badge").textContent = `${charObj.name} (${ch.quality})`;
+    $("char-quality").value = ch.quality || "medium";
+    $("char-pose").value = ch.pose || "a_pose";
+    const rbfN = Array.isArray(ch.rbf_nodes) ? ch.rbf_nodes.length : 0;
+    $("char-rbf-count").textContent = `${rbfN} NODE${rbfN === 1 ? "" : "S"}`;
+
+    if (ch.body) {
+      document.querySelectorAll("[data-char-body]").forEach((el) => {
+        const k = el.dataset.charBody;
+        if (ch.body[k] !== undefined) {
+          el.value = String(ch.body[k]);
+          const lbl = $(`cs-${k}-v`);
+          if (lbl) lbl.textContent = Number(ch.body[k]).toFixed(2);
+        }
+      });
+      const hu = 7.4 / Math.max(0.85, Number(ch.body.head_scale || 1.0));
+      $("char-hu-badge").textContent = `${hu.toFixed(2)} HU`;
+      $("char-anthro-lbl").textContent = `Active: ${charObj.name} | ${hu.toFixed(2)} HU | ${charObj.vertex_count}v / ${charObj.face_count}f`;
+    }
+    if (ch.expressions) {
+      document.querySelectorAll("[data-char-expr]").forEach((el) => {
+        const k = el.dataset.charExpr;
+        if (ch.expressions[k] !== undefined) {
+          el.value = String(ch.expressions[k]);
+          const lbl = $(`ce-${k}-v`);
+          if (lbl) lbl.textContent = Number(ch.expressions[k]).toFixed(2);
+        }
+      });
+    }
+    if (ch.face) {
+      document.querySelectorAll("[data-char-face]").forEach((el) => {
+        const k = el.dataset.charFace;
+        if (ch.face[k] !== undefined) {
+          el.value = String(ch.face[k]);
+          const lbl = $(`cf-${k}-v`);
+          if (lbl) lbl.textContent = Number(ch.face[k]).toFixed(2);
+        }
+      });
+    }
+    if (ch.materials) {
+      $("cm-skin").value = rgbToHex(ch.materials.skin_tone);
+      $("cm-eye").value = rgbToHex(ch.materials.eye_color);
+      $("cm-lip").value = rgbToHex(ch.materials.lip_tint);
+      $("cm-hair").value = rgbToHex(ch.materials.hair_color);
+      $("cm-hair-style").value = ch.materials.hair_style || "short";
+      const hLen = Number(ch.materials.hair_length ?? 1.0);
+      const hVol = Number(ch.materials.hair_volume ?? 1.0);
+      const hCurl = Number(ch.materials.hair_curl ?? 0.15);
+      const hPart = Number(ch.materials.hair_part ?? 0.25);
+      $("cm-hair-length").value = String(hLen);
+      $("cm-hair-length-v").textContent = hLen.toFixed(2);
+      $("cm-hair-volume").value = String(hVol);
+      $("cm-hair-volume-v").textContent = hVol.toFixed(2);
+      $("cm-hair-curl").value = String(hCurl);
+      $("cm-hair-curl-v").textContent = hCurl.toFixed(2);
+      $("cm-hair-part").value = String(hPart);
+      $("cm-hair-part-v").textContent = hPart.toFixed(2);
+      $("cm-clothing-style").value = ch.materials.clothing_style || "casual";
+      if (ch.materials.top_color) $("cm-top").value = rgbToHex(ch.materials.top_color);
+      if (ch.materials.bottom_color) $("cm-bottom").value = rgbToHex(ch.materials.bottom_color);
+      const sss = Number(ch.materials.subsurface_strength ?? 0.55);
+      $("cm-sss").value = String(sss);
+      $("cm-sss-v").textContent = sss.toFixed(2);
+    }
+  }
+
+  async function loadCharacterPresets() {
+    try {
+      const data = await api("/api/character/presets");
+      state.charPresets = data;
+      populateDeltaSourceSelect(state.scene);
+    } catch (_) {}
+  }
+
+  async function applyCharacterUpdate(includeMats = false) {
+    const obj = getActiveCharacterObj();
+    if (!obj) return toast("Select a procedural character first", "warn");
+    const sliders = collectCharSliders();
+    const payload = {
+      quality: $("char-quality").value,
+      pose: $("char-pose").value,
+      body: sliders.body,
+      face: sliders.face,
+      expressions: sliders.expressions,
+    };
+    if (includeMats) payload.materials = collectCharMaterials();
+    const res = await api(`/api/character/${encodeURIComponent(obj.id)}/update`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    updateCharAnthropometryBanner(res.anthropometry);
+    await refreshAll();
+    toast(`Updated character (${res.total_vertex_count || res.vertex_count}v)`, "ok");
+  }
+
+  function scheduleCharSliderUpdate() {
+    const obj = getActiveCharacterObj();
+    if (!obj) return;
+    if (state.charUpdateTimer) clearTimeout(state.charUpdateTimer);
+    state.charUpdateTimer = setTimeout(() => {
+      applyCharacterUpdate(false).catch((err) => toast(err.message, "err"));
+    }, 320);
+  }
+
+  document.querySelectorAll("[data-char-body]").forEach((el) => {
+    el.oninput = (e) => {
+      const k = el.dataset.charBody;
+      const v = Number(e.target.value);
+      const lbl = $(`cs-${k}-v`);
+      if (lbl) lbl.textContent = v.toFixed(2);
+      if (k === "head_scale") {
+        $("char-hu-badge").textContent = `${(7.4 / Math.max(0.85, v)).toFixed(2)} HU`;
+      }
+      scheduleCharSliderUpdate();
+    };
+  });
+
+  document.querySelectorAll("[data-char-expr]").forEach((el) => {
+    el.oninput = (e) => {
+      const k = el.dataset.charExpr;
+      const lbl = $(`ce-${k}-v`);
+      if (lbl) lbl.textContent = Number(e.target.value).toFixed(2);
+      scheduleCharSliderUpdate();
+    };
+  });
+
+  document.querySelectorAll("[data-char-face]").forEach((el) => {
+    el.oninput = (e) => {
+      const k = el.dataset.charFace;
+      const lbl = $(`cf-${k}-v`);
+      if (lbl) lbl.textContent = Number(e.target.value).toFixed(2);
+      scheduleCharSliderUpdate();
+    };
+  });
+
+  $("cm-hair-length").oninput = (e) => { $("cm-hair-length-v").textContent = Number(e.target.value).toFixed(2); };
+  $("cm-hair-volume").oninput = (e) => { $("cm-hair-volume-v").textContent = Number(e.target.value).toFixed(2); };
+  $("cm-hair-curl").oninput = (e) => { $("cm-hair-curl-v").textContent = Number(e.target.value).toFixed(2); };
+  $("cm-hair-part").oninput = (e) => { $("cm-hair-part-v").textContent = Number(e.target.value).toFixed(2); };
+  $("cm-sss").oninput = (e) => { $("cm-sss-v").textContent = Number(e.target.value).toFixed(2); };
+  $("crbf-weight").oninput = (e) => { $("crbf-weight-v").textContent = Number(e.target.value).toFixed(2); };
+  $("cdelta-alpha").oninput = (e) => { $("cdelta-alpha-v").textContent = Number(e.target.value).toFixed(2); };
+
+  $("char-skin-preset").onchange = (e) => {
+    const k = e.target.value;
+    if (!k || !state.charPresets || !state.charPresets.skin_tone_presets) return;
+    const rgb = state.charPresets.skin_tone_presets[k];
+    if (rgb) $("cm-skin").value = rgbToHex(rgb);
+  };
+
+  $("btn-char-create").onclick = async () => {
+    $("btn-char-create").disabled = true;
+    try {
+      const res = await api("/api/character/create", {
+        method: "POST",
+        body: JSON.stringify({
+          preset: $("char-preset").value,
+          quality: $("char-quality").value,
+          pose: $("char-pose").value,
+        }),
+      });
+      state.selectedId = res.object_id;
+      updateCharAnthropometryBanner(res.anthropometry);
+      await refreshAll(true);
+      toast(`Created Character: ${res.name} (${res.total_vertex_count || res.vertex_count}v)`, "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    } finally {
+      $("btn-char-create").disabled = false;
+    }
+  };
+
+  $("btn-char-rebuild").onclick = () => applyCharacterUpdate(true).catch((e) => toast(e.message, "err"));
+  $("btn-char-apply-sliders").onclick = () => applyCharacterUpdate(false).catch((e) => toast(e.message, "err"));
+  $("btn-char-apply-mats").onclick = () => applyCharacterUpdate(true).catch((e) => toast(e.message, "err"));
+
+  $("btn-char-sculpt").onclick = async () => {
+    const obj = getActiveCharacterObj();
+    if (!obj) return toast("Select a character first", "warn");
+    try {
+      const res = await api(`/api/character/${encodeURIComponent(obj.id)}/sculpt_rbf`, {
+        method: "POST",
+        body: JSON.stringify({
+          region: $("crbf-region").value,
+          weight: parseFloat($("crbf-weight").value),
+          radius: parseFloat($("crbf-radius").value) || 0.30,
+          mirror_x: $("crbf-mirror").checked,
+        }),
+      });
+      await refreshAll();
+      toast(`Applied RBF sculpt (${res.rbf_node_count} total nodes)`, "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  };
+
+  $("btn-char-clear-rbf").onclick = async () => {
+    const obj = getActiveCharacterObj();
+    if (!obj) return toast("Select a character first", "warn");
+    try {
+      await api(`/api/character/${encodeURIComponent(obj.id)}/sculpt_rbf`, {
+        method: "POST",
+        body: JSON.stringify({ clear_rbf: true }),
+      });
+      await refreshAll();
+      toast("Cleared RBF sculpt nodes", "warn");
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  };
+
+  $("btn-char-extract-delta").onclick = async () => {
+    const obj = getActiveCharacterObj();
+    if (!obj) return toast("Select a character first", "warn");
+    try {
+      const res = await api(`/api/character/${encodeURIComponent(obj.id)}/extract_edit_delta`, {
+        method: "POST",
+        body: JSON.stringify({ region: $("crbf-region").value || "mesh_edit" }),
+      });
+      await refreshAll();
+      toast(`Extracted ${res.extracted_nodes} RBF delta node(s) from mesh edit`, "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  };
+
+  async function runCharDeltaBlend(mode) {
+    const obj = getActiveCharacterObj();
+    if (!obj) return toast("Select a character first", "warn");
+    const rawSrc = $("cdelta-source").value || "preset:realistic_female";
+    const body = {
+      mode,
+      region: $("cdelta-region").value,
+      alpha: parseFloat($("cdelta-alpha").value),
+    };
+    if (rawSrc.startsWith("obj:")) body.source_id = rawSrc.slice(4);
+    else if (rawSrc.startsWith("preset:")) body.preset = rawSrc.slice(7);
+    try {
+      const res = await api(`/api/character/${encodeURIComponent(obj.id)}/blend_delta`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      updateCharAnthropometryBanner(res.anthropometry);
+      await refreshAll();
+      toast(`Applied ${mode} (${body.region} @ ${body.alpha.toFixed(2)})`, "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
+  }
+
+  $("btn-char-blend").onclick = () => runCharDeltaBlend("blend");
+  $("btn-char-apply-delta").onclick = () => runCharDeltaBlend("apply_delta");
+
   window.addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
     if (e.key === "Tab") { e.preventDefault(); setEditMode(!state.editMode); }
@@ -1027,6 +1420,7 @@
   // Boot
   refreshAll(true);
   loadMcpInfo();
+  loadCharacterPresets();
   connectWebSocket();
   searchTextures();
 })();

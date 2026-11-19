@@ -25,14 +25,14 @@ def _parse_text_json(result) -> dict:
     return json.loads(texts[0])
 
 
-async def test_mcp_discovery_surfaces_34_tools_resources_and_prompts(
+async def test_mcp_discovery_surfaces_35_tools_resources_and_prompts(
     mcp_session_and_client,
 ) -> None:
     _, client, _ = mcp_session_and_client
 
     tools = await client.list_tools()
     tool_names = {t.name for t in tools.tools}
-    assert len(tool_names) == 34
+    assert len(tool_names) == 35
     expected_tools = {
         "scene_new",
         "scene_open",
@@ -68,6 +68,7 @@ async def test_mcp_discovery_surfaces_34_tools_resources_and_prompts(
         "render_video_file",
         "physics_manage",
         "armature_rig",
+        "character_manage",
     }
     assert expected_tools == tool_names
 
@@ -845,9 +846,9 @@ async def test_mcp_blender_parity_catmull_clark_smart_uv_sky_ggx_denoise_ik(
 ) -> None:
     _, client, workspace = mcp_session_and_client
 
-    # 0. Verify tool count remains strictly 34
+    # 0. Verify tool count remains strictly 35
     tools_resp = await client.list_tools()
-    assert len(tools_resp.tools) == 34
+    assert len(tools_resp.tools) == 35
 
     await client.call_tool("scene_new", {"name": "ParityE2E", "clear_history": True})
 

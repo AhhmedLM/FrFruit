@@ -395,7 +395,8 @@
 
     _ensureTexture(mat) {
       if (!this.gl || !mat.has_albedo_map) return null;
-      const key = `${mat.id}:${mat.name}`;
+      const sig = mat.albedo_sig || "";
+      const key = `${mat.id}:${mat.name}:${sig}`;
       if (this.texCache.has(key)) return this.texCache.get(key);
 
       const gl = this.gl;
@@ -421,7 +422,7 @@
         rec.ready = true;
         this.render();
       };
-      img.src = `/api/texture_preview?material_id=${encodeURIComponent(mat.id)}&channel=albedo`;
+      img.src = `/api/texture_preview?material_id=${encodeURIComponent(mat.id)}&channel=albedo&v=${encodeURIComponent(sig)}`;
       return rec;
     }
 
