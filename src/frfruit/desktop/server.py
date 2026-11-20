@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
+import os
 import re
 import sys
 import threading
@@ -71,6 +73,7 @@ from frfruit.geometry.spatial import (
     evaluate_object_mesh,
     evaluate_scene_meshes,
 )
+from frfruit.io.cloud_sync import create_cloud_sync_from_env
 from frfruit.io.exporters import export_scene_file
 from frfruit.io.project import load_project, save_project
 from frfruit.mcp_server.context import FrFruitSession
@@ -563,6 +566,7 @@ def create_studio_app(
     host: str = "127.0.0.1",
     port: int = 8765,
     preload_project: str | Path | None = None,
+    api_key: str | None = None,
 ) -> tuple[Starlette, FrFruitSession, MCPServer]:
     """Build unified Starlette app serving Studio UI, REST/WebSocket API, and live MCP endpoints."""
     mcp_srv, sess = create_server(workspace_root=workspace_root)
@@ -572,29 +576,56 @@ def create_studio_app(
             sess.scene = loaded
             sess.history.clear()
 
-    # Transport security allowing local workstation & TestClient
+    resolved_api_key = (
+        api_key if api_key is not None else os.environ.get("FRFRUIT_API_KEY", "")
+    ).strip()
+
+    allowed_hosts = [
+        "127.0.0.1",
+        "127.0.0.1:*",
+        "localhost",
+        "localhost:*",
+        "[::1]",
+        "[::1]:*",
+        "testserver",
+        "testserver:*",
+    ]
+    allowed_origins = [
+        "http://127.0.0.1",
+        "http://127.0.0.1:*",
+        "http://localhost",
+        "http://localhost:*",
+        "http://[::1]",
+        "http://[::1]:*",
+        "http://testserver",
+        "http://testserver:*",
+    ]
+
+    env_hosts = os.environ.get("FRFRUIT_ALLOWED_HOSTS", "").strip()
+    space_host = os.environ.get("SPACE_HOST", "").strip()
+    disable_rebinding_env = os.environ.get("FRFRUIT_DISABLE_DNS_REBINDING", "").strip().lower()
+    disable_dns_rebinding = (
+        env_hosts == "*"
+        or disable_rebinding_env in {"1", "true", "yes"}
+        or (host == "0.0.0.0" and not env_hosts)
+        or bool(space_host)
+    )
+
+    if env_hosts and env_hosts != "*":
+        for raw_h in env_hosts.split(","):
+            h = raw_h.strip()
+            if h:
+                allowed_hosts.extend([h, f"{h}:*"])
+                allowed_origins.extend([f"https://{h}", f"http://{h}"])
+    if space_host:
+        allowed_hosts.extend([space_host, f"{space_host}:*"])
+        allowed_origins.extend([f"https://{space_host}", f"http://{space_host}"])
+
+    # Transport security allowing local workstation, TestClient, and configured cloud hosts
     tsec = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            "127.0.0.1",
-            "127.0.0.1:*",
-            "localhost",
-            "localhost:*",
-            "[::1]",
-            "[::1]:*",
-            "testserver",
-            "testserver:*",
-        ],
-        allowed_origins=[
-            "http://127.0.0.1",
-            "http://127.0.0.1:*",
-            "http://localhost",
-            "http://localhost:*",
-            "http://[::1]",
-            "http://[::1]:*",
-            "http://testserver",
-            "http://testserver:*",
-        ],
+        enable_dns_rebinding_protection=not disable_dns_rebinding,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
     )
     mcp_stream_app = mcp_srv.streamable_http_app(
         streamable_http_path="/mcp", transport_security=tsec
@@ -1936,11 +1967,23 @@ def create_studio_app(
             async with ws_lock:
                 ws_queues.discard(q)
 
+    async def api_health(_req: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
+    cloud_sync = create_cloud_sync_from_env(sess.workspace_root)
+
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
         loop = asyncio.get_running_loop()
 
+        if cloud_sync is not None:
+            await asyncio.to_thread(cloud_sync.pull_on_startup)
+            cloud_sync.start()
+
         def on_session_event(payload: dict[str, Any]) -> None:
+            if cloud_sync is not None:
+                cloud_sync.mark_dirty()
+
             def _dispatch() -> None:
                 for q in list(ws_queues):
                     try:
@@ -1957,9 +2000,12 @@ def create_studio_app(
                 yield
         finally:
             sess.remove_listener(on_session_event)
+            if cloud_sync is not None:
+                await asyncio.to_thread(cloud_sync.stop)
 
     static_dir = _resolve_static_dir()
     routes: list[Any] = [
+        Route("/health", api_health, methods=["GET"]),
         Route("/api/state", api_state, methods=["GET"]),
         Route("/api/geometry", api_geometry, methods=["GET"]),
         Route("/api/texture_preview", api_texture_preview, methods=["GET"]),
@@ -2205,8 +2251,60 @@ def create_studio_app(
 
             await self.asgi_app(scope, receive, send)
 
+    class _BearerAuthMiddleware:
+        """Protect MCP, WebSocket, and API endpoints when FRFRUIT_API_KEY is configured."""
+
+        def __init__(self, asgi_app: ASGIApp, token: str) -> None:
+            self.asgi_app = asgi_app
+            self.token = token
+
+        @staticmethod
+        def _is_protected_path(path: str) -> bool:
+            return (
+                path == "/mcp"
+                or path == "/sse"
+                or path.startswith("/messages")
+                or path.startswith("/api/")
+                or path == "/ws/events"
+            )
+
+        def _is_authorized(self, scope: Scope) -> bool:
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in (scope.get("headers") or [])
+            }
+            auth = headers.get("authorization", "")
+            candidate = ""
+            if auth.lower().startswith("bearer "):
+                candidate = auth[7:].strip()
+            if not candidate:
+                candidate = headers.get("x-api-key", "").strip()
+            if not candidate:
+                qs = urllib.parse.parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+                candidate = (qs.get("token") or [""])[0].strip()
+            return bool(candidate) and hmac.compare_digest(candidate, self.token)
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            scope_type = scope.get("type")
+            if scope_type in {"http", "websocket"}:
+                path = scope.get("path", "")
+                if self._is_protected_path(path) and not self._is_authorized(scope):
+                    if scope_type == "websocket":
+                        await send({"type": "websocket.close", "code": 4401})
+                        return
+                    resp = JSONResponse(
+                        {"status": "error", "error": "Unauthorized: invalid or missing API key"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+                    await resp(scope, receive, send)
+                    return
+            await self.asgi_app(scope, receive, send)
+
     app = Starlette(routes=routes, lifespan=lifespan)
     app.add_middleware(_McpTelemetryMiddleware)
+    if resolved_api_key:
+        app.add_middleware(_BearerAuthMiddleware, token=resolved_api_key)
     app.state.frfruit_session = sess
     app.state.frfruit_mcp = mcp_srv
     app.state.get_mcp_clients = _snapshot_mcp_clients

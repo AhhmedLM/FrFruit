@@ -47,6 +47,9 @@ dev = [
 desktop = [
   "pywebview>=5.3",
 ]
+cloud = [
+  "huggingface-hub>=0.25.0",
+]
 
 [project.scripts]
 frfruit = "frfruit.cli:main"

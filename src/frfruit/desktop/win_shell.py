@@ -146,8 +146,9 @@ def launch_studio(
     thread = threading.Thread(target=server.run, name="frfruit-studio-uvicorn", daemon=True)
     thread.start()
 
-    base_url = f"http://{host}:{chosen_port}"
-    _wait_ready(f"{base_url}/api/mcp/info", timeout=12.0)
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
+    base_url = f"http://{probe_host}:{chosen_port}"
+    _wait_ready(f"{base_url}/health", timeout=12.0)
     _write_studio_session(base_url, ws_root)
     atexit.register(_cleanup_studio_session)
 
