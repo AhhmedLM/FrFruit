@@ -1,3 +1,12 @@
+---
+title: FrFruit MCP
+emoji: 🍎
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+---
+
 # FrFruit
 
 **FrFruit** is an AI-first 3D modeling, procedural generation, physics/cloth simulation, animation, path-traced rendering, and workstation visualization engine built natively for AI agents via the **Model Context Protocol (MCP)** — *"like Blender, engineered from the ground up for AI MCP rather than GUI mouse clicks."*
