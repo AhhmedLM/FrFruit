@@ -16,6 +16,11 @@ from frfruit.animation.armature import (
     compute_armature_matrices,
     solve_armature_ik,
 )
+from frfruit.animation.locomotion import (
+    bake_locomotion_to_timeline,
+    build_cycle_schedule,
+    build_showcase_schedule,
+)
 from frfruit.animation.timeline import FCurveTrack, Keyframe
 from frfruit.core.math3d import transform_points
 from frfruit.core.scene import (
@@ -565,9 +570,15 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                 "set_pose",
                 "solve_ik",
                 "keyframe_pose",
+                "generate_locomotion",
                 "list",
             ],
-            Field(description="Skeletal rig creation, auto-skinning, FK/IK posing, or keyframing."),
+            Field(
+                description=(
+                    "Skeletal rig creation, auto-skinning, FK/IK posing, keyframing, "
+                    "or AAA humanoid locomotion synthesis."
+                )
+            ),
         ],
         armature_id: Annotated[str | None, Field(description="Armature object ID or name.")] = None,
         name: Annotated[str | None, Field(description="Name for new armature object.")] = None,
@@ -590,6 +601,10 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
             str | None, Field(description="Target mesh ID or name to auto-skin.")
         ] = None,
         max_influences: Annotated[int, Field(ge=1, le=8)] = 4,
+        skinning_mode: Annotated[
+            Literal["lbs", "dqs"] | None,
+            Field(description="Optional skinning algorithm ('lbs' or volume-preserving 'dqs')."),
+        ] = None,
         rotation_deg: Annotated[
             Vec3 | None, Field(description="Bone pose Euler XYZ degrees.")
         ] = None,
@@ -609,6 +624,17 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
         frame: Annotated[
             int | None, Field(description="Keyframe number for keyframe_pose or solve_ik.")
         ] = None,
+        locomotion_style: Annotated[
+            Literal["showcase", "combat_idle", "heavy_walk", "combat_jog", "explosive_sprint"],
+            Field(description="Gait preset or full showcase for action='generate_locomotion'."),
+        ] = "showcase",
+        duration_s: Annotated[
+            float, Field(gt=0.2, le=60.0, description="Duration in seconds for locomotion baking.")
+        ] = 18.0,
+        fps: Annotated[int, Field(ge=10, le=120, description="Timeline FPS for locomotion.")] = 30,
+        root_motion: Annotated[
+            bool, Field(description="Apply world root motion translation to Hips bone.")
+        ] = True,
     ) -> dict[str, Any]:
         """Create armatures, auto-skin meshes, pose FK/IK chains, and keyframe bone poses."""
         sess = get_session()
@@ -702,6 +728,43 @@ def register_sim_fx_tools(mcp: MCPServer, get_session: Callable[[], FrFruitSessi
                     "object_id": mobj.id,
                     "armature_id": arm_obj.id,
                     "bones_weighted": {b: len(w) for b, w in skin.weights.items() if w},
+                }
+
+            if action == "generate_locomotion":
+                sess.push_history(f"generate_locomotion:{arm_obj.name}:{locomotion_style}")
+                if skinning_mode is not None:
+                    arm_obj.armature.skinning_mode = skinning_mode
+                sched = (
+                    build_showcase_schedule(fps=fps, duration_s=duration_s)
+                    if locomotion_style == "showcase"
+                    else build_cycle_schedule(
+                        style=locomotion_style, fps=fps, duration_s=duration_s
+                    )
+                )
+                meta = bake_locomotion_to_timeline(
+                    sess.scene,
+                    arm_obj,
+                    sched,
+                    fps=fps,
+                    apply_root_motion_to_hips=root_motion,
+                )
+                sess.notify(
+                    "locomotion_generated",
+                    {
+                        "armature_id": arm_obj.id,
+                        "style": locomotion_style,
+                        "frames": len(meta),
+                    },
+                )
+                return {
+                    "status": "ok",
+                    "armature_id": arm_obj.id,
+                    "style": locomotion_style,
+                    "skinning_mode": arm_obj.armature.skinning_mode,
+                    "fps": fps,
+                    "frames": len(meta),
+                    "total_distance_m": round(abs(sched[-1].root_y), 3),
+                    "tracks": len(sess.scene.timeline.tracks),
                 }
 
             # set_pose / solve_ik / keyframe_pose

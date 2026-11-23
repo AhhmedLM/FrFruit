@@ -50,7 +50,7 @@ def create_server(workspace_root: str | Path | None = None) -> tuple[MCPServer, 
             "rigging, path-traced rendering, video/FBX export, and MCP engine."
         ),
         instructions=SERVER_INSTRUCTIONS,
-        version="0.2.1",
+        version="0.3.0",
     )
 
     def get_session() -> FrFruitSession:

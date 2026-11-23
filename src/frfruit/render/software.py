@@ -213,25 +213,51 @@ def _rasterize_gbuffer(
     b1_eye = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     b2_eye = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
-    for ti in cand_idx:
-        _rasterize_subtri(
-            int(ti),
-            float(x0_all[ti]),
-            float(y0_all[ti]),
-            float(z0_all[ti]),
-            float(w0_all[ti]),
-            float(x1_all[ti]),
-            float(y1_all[ti]),
-            float(z1_all[ti]),
-            float(w1_all[ti]),
-            float(x2_all[ti]),
-            float(y2_all[ti]),
-            float(z2_all[ti]),
-            float(w2_all[ti]),
-            b0_eye,
-            b1_eye,
-            b2_eye,
-        )
+    from frfruit.render._fast_raster import rasterize_candidates_fast
+
+    used_fast = rasterize_candidates_fast(
+        cand_idx,
+        x0_all,
+        y0_all,
+        z0_all,
+        w0_all,
+        x1_all,
+        y1_all,
+        z1_all,
+        w1_all,
+        x2_all,
+        y2_all,
+        z2_all,
+        w2_all,
+        width,
+        height,
+        cull_backfaces,
+        z_buf,
+        tri_id_buf,
+        u_buf,
+        v_buf,
+        edge_px_buf,
+    )
+    if not used_fast:
+        for ti in cand_idx:
+            _rasterize_subtri(
+                int(ti),
+                float(x0_all[ti]),
+                float(y0_all[ti]),
+                float(z0_all[ti]),
+                float(w0_all[ti]),
+                float(x1_all[ti]),
+                float(y1_all[ti]),
+                float(z1_all[ti]),
+                float(w1_all[ti]),
+                float(x2_all[ti]),
+                float(y2_all[ti]),
+                float(z2_all[ti]),
+                float(w2_all[ti]),
+                b0_eye,
+                b1_eye,
+                b2_eye,
+            )
 
     # Clip near-plane straddling triangles cleanly against g = z_clip + w_clip >= 0
     for ti in straddle_idx:

@@ -287,6 +287,7 @@ class ArmatureSpec(BaseModel):
 
     bones: list[BoneSpec] = Field(default_factory=list)
     ik_targets: list[IKConstraintSpec] = Field(default_factory=list)
+    skinning_mode: Literal["lbs", "dqs"] = "lbs"
 
 
 class SkinWeightSpec(BaseModel):

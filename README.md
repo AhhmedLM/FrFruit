@@ -27,9 +27,9 @@ FrFruit gives AI models semantic geometry editing, JSON procedural node graphs, 
   - Co-hosted Starlette backend serving REST API (`/api/*`), live WebSocket (`/ws/events`), and unified **Streamable HTTP (`/mcp`)** + **SSE (`/sse`)** MCP transports sharing a single live `FrFruitSession`.
   - Runs inside native **WebView2** (`pywebview`), Windows Edge/Chrome `--app=` frameless mode, or packages into a standalone Windows `.exe` (`windows_app\build_windows_exe.ps1`).
 - **Rigid-Body & XPBD Cloth Physics (`physics_manage`, `frfruit physics`)**: Impulse rigid-body dynamics with restitution/friction and pairwise sphere/AABB collisions baked to `FCurveTrack`s, plus vectorized weighted-Jacobi **XPBD Cloth** with pinning presets (`top_corners`, `top_edge`, `border`, `indices`, `none`), wind gusts, floor bounds, and scene collider push-out baked to `vertex_cache`.
-- **Skeletal Rigging & Game-Ready Animated FBX 7.4 (`armature_rig`, `export_scene`)**: FK armature bone hierarchies, automatic top-K vertex weight skinning (`auto_rig`), Linear Blend Skinning (LBS), and a zero-dependency Kaydara **Binary FBX 7.400** & **ASCII FBX** exporter supporting **`unreal`** (Z-up), **`unity`** (Y-up), **`godot`**, and **`generic`** presets — complete with normals, MikkTSpace tangents/binormals, UVs, textures, `Skin`/`Cluster`/`BindPose`, MorphTarget `Shape` blendshapes (baked cloth), and `AnimationCurve`s.
+- **Skeletal Rigging, AAA Locomotion & Animated FBX (`armature_rig`, `import_mesh`, `export_scene`)**: Pure-Python **Binary FBX 7.1–7.7 importer** (meshes, UVs, materials, skeletal armatures & exact cluster weights), FK/FABRIK + analytical **2-bone IK**, volume-preserving **Dual Quaternion Skinning (DQS)** & LBS, procedural **AAA gameplay locomotion** (`generate_locomotion`: Combat Idle, Heavy Walk, Combat Jog, Explosive Sprint, Heavy Hard Stop with foot-roll locking), and Kaydara **Binary FBX 7.400** & **ASCII FBX** export (`unreal`, `unity`, `godot`, `generic`).
 - **Online & Procedural PBR Texture Libraries (`texture_library`, `frfruit textures`)**: Search & download 6-channel PBR maps (`albedo`, `normal`, `roughness`, `metallic`, `ao`, `height`) from **Poly Haven** and **ambientCG** (with ARM unpacking and local seamless procedural fallback), bilinear UV sampling, world-space triplanar UV fallback, and Gram-Schmidt TBN normal perturbation.
-- **Constructive & Semantic Modeling + Procedural Nodes + Spatial AI Tools**: Primitives, 2D/3D curves, semantic Edit Mesh, exact `manifold3d` CSG booleans, 11 non-destructive modifiers, 18-node JSON Procedural DAGs, collision detection, smart placement, GLB/GLTF/OBJ/STL/PLY/Blender `.py` export.
+- **Constructive & Semantic Modeling + Procedural Nodes + Spatial AI Tools**: Primitives, 2D/3D curves, semantic Edit Mesh, exact `manifold3d` CSG booleans, 11 non-destructive modifiers, 18-node JSON Procedural DAGs, collision detection, smart placement, FBX/GLB/GLTF/OBJ/STL/PLY/Blender `.py` import & export.
 - **34 MCP Tools, 6 Resources + 1 Resource Template, 3 Prompts**: Exposed via official `mcp` Python SDK (`stdio`, `streamable-http`, `sse`).
 
 ---
@@ -41,11 +41,11 @@ src/frfruit/
 ├── core/         # Pydantic SceneDocument IR (.frf.json), transforms, undo/redo snapshots
 ├── geometry/     # Primitives, curves, Edit Mesh, CSG booleans, 11 modifiers, spatial tools
 ├── procedural/   # 18-node JSON ProceduralGraph DAG schema & deterministic evaluator
-├── animation/    # Timeline F-curves, armature FK bones, auto-skinning, LBS evaluation
+├── animation/    # Timeline F-curves, FK/IK armatures, DQS/LBS skinning, AAA locomotion engine
 ├── physics/      # Impulse rigid-body dynamics & vectorized XPBD cloth solver
 ├── textures/     # Poly Haven / ambientCG fetcher, procedural PBR maps, bilinear/TBN loader
-├── render/       # Software rasterizer, BVH PathTracer, Post-Processing, MP4/WebM/GIF video
-├── io/           # .frf.json projects, Binary/ASCII FBX 7.4, GLB/GLTF/OBJ/STL/PLY/Blender
+├── render/       # Software rasterizer (+ C fast path), BVH PathTracer, Post-Processing, MP4 video
+├── io/           # .frf.json projects, Binary FBX 7.x import/export, GLB/GLTF/OBJ/STL/PLY/Blender
 ├── desktop/      # Co-hosted Starlette UI/WS/MCP bridge, WebGL2 CAD UI, Windows shell launcher
 ├── mcp_server/   # 34 MCP tools, 6 static resources + template, 3 guided prompts
 └── cli.py        # `frfruit` CLI (`serve`, `app`, `render`, `video`, `export`, `textures`, `physics`, `info`)

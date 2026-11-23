@@ -155,10 +155,21 @@ def import_mesh_file(
     convert_yup: bool | None = None,
     texture_dir: str | Path | None = None,
 ) -> list[SceneObject]:
-    """Import a .glb/.gltf/.obj/.stl/.ply file into `scene` as SceneObjects with PBR maps."""
+    """Import a .fbx/.glb/.gltf/.obj/.stl/.ply file into `scene` as SceneObjects with PBR maps."""
     p = Path(file_path)
     if not p.exists():
         raise FileNotFoundError(f"Mesh file not found: {p}")
+
+    if p.suffix.lower() == ".fbx":
+        from frfruit.io.fbx_importer import import_fbx_file
+
+        return import_fbx_file(
+            scene,
+            p,
+            name_prefix=name_prefix,
+            collection_id=collection_id,
+            convert_yup=convert_yup,
+        )
 
     is_gltf = p.suffix.lower() in (".glb", ".gltf")
     if convert_yup is None:
